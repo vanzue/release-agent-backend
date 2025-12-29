@@ -246,9 +246,11 @@ export async function runSession(db: Db, sessionId: string) {
           
           // Save summaries to database and build results
           for (const summary of batchResult.summaries) {
-            const commit = commits.find(c => c.sha === summary.commitSha);
+            // LLM returns short SHA (7 chars), need to match with full SHA using startsWith
+            const commit = commits.find(c => c.sha.startsWith(summary.commitSha));
+            const fullSha = commit?.sha ?? summary.commitSha; // Use full SHA if found
             const creditedLogin = commit?.author?.login ?? null;
-            const prDetails = commitToPrDetails.get(summary.commitSha);
+            const prDetails = commitToPrDetails.get(fullSha);
             const prNumber = prDetails?.number ?? null;
             
             // Format the summary with thanks and PR link
@@ -260,14 +262,14 @@ export async function runSession(db: Db, sessionId: string) {
             
             await upsertCommitSummary(db, {
               repoFullName,
-              commitSha: summary.commitSha,
+              commitSha: fullSha,
               summaryText: formattedText,
               creditedLogin,
               prNumber,
             });
             
             newResults.push({
-              sha: summary.commitSha,
+              sha: fullSha,
               summaryText: formattedText,
               area: summary.area,
             });
