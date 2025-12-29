@@ -147,6 +147,12 @@ export async function runSession(db: Db, sessionId: string) {
 
     // Get ReleaseNotesAgent for LLM-powered summaries
     const releaseNotesAgent = getReleaseNotesAgent();
+    logger.info({ 
+      sessionId, 
+      llmAvailable: releaseNotesAgent !== null,
+      llmProvider: process.env.LLM_PROVIDER ?? 'azure',
+      llmModel: process.env.LLM_MODEL ?? 'not-set',
+    }, 'LLM client status');
     
     // Separate commits that need LLM processing from cached ones
     const cachedResults: Array<{ sha: string; summaryText: string; area: string }> = [];
@@ -214,9 +220,29 @@ export async function runSession(db: Db, sessionId: string) {
     if (commitsToProcess.length > 0) {
       if (releaseNotesAgent) {
         try {
-          logger.info({ sessionId, count: commitsToProcess.length }, 'Generating release notes with LLM');
+          logger.info({ 
+            sessionId, 
+            count: commitsToProcess.length,
+            sampleCommit: commitsToProcess[0] ? {
+              sha: commitsToProcess[0].sha.slice(0, 7),
+              hasPrDescription: !!commitsToProcess[0].prDescription,
+              hasDiff: !!commitsToProcess[0].diff,
+              prLabels: commitsToProcess[0].prLabels,
+            } : null,
+          }, 'Starting LLM release notes generation');
           
           const batchResult = await releaseNotesAgent.summarizeCommitsBatch(commitsToProcess);
+          
+          logger.info({ 
+            sessionId, 
+            summariesReturned: batchResult.summaries.length,
+            sampleSummary: batchResult.summaries[0] ? {
+              sha: batchResult.summaries[0].commitSha?.slice(0, 7),
+              area: batchResult.summaries[0].area,
+              type: batchResult.summaries[0].type,
+              summaryLength: batchResult.summaries[0].summary?.length,
+            } : null,
+          }, 'LLM returned batch results');
           
           // Save summaries to database and build results
           for (const summary of batchResult.summaries) {
@@ -250,14 +276,27 @@ export async function runSession(db: Db, sessionId: string) {
           logger.info({ sessionId, generated: newResults.length }, 'LLM release notes generation complete');
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error);
-          logger.error({ err: error, sessionId }, 'LLM release notes generation failed');
+          const errorStack = error instanceof Error ? error.stack : undefined;
+          logger.error({ 
+            err: error, 
+            sessionId, 
+            errorMessage,
+            errorStack,
+            errorName: error instanceof Error ? error.name : 'unknown',
+          }, 'LLM release notes generation failed');
           await setJob(db, sessionId, 'generate-notes', 'failed', 0, errorMessage);
           await setSessionStatus(db, sessionId, 'failed');
           throw new Error(`LLM release notes generation failed: ${errorMessage}`);
         }
       } else {
         // Fallback to simple extraction if LLM not available
-        logger.warn({ sessionId }, 'LLM not configured, using simple commit message extraction');
+        logger.warn({ 
+          sessionId,
+          llmProvider: process.env.LLM_PROVIDER ?? 'not-set',
+          llmModel: process.env.LLM_MODEL ?? 'not-set',
+          azureEndpoint: process.env.AZURE_OPENAI_ENDPOINT ? 'set' : 'not-set',
+          azureApiKey: process.env.AZURE_OPENAI_API_KEY ? 'set' : 'not-set',
+        }, 'LLM not configured, using simple commit message extraction - CHECK ENV VARS');
         
         for (const c of commitsToProcess) {
           const commit = commits.find(cm => cm.sha === c.sha);

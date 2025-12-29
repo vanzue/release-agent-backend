@@ -36,19 +36,39 @@ export class ReleaseNotesAgent {
    * Summarize a single commit for release notes.
    */
   async summarizeCommit(commit: CommitInput): Promise<CommitSummary> {
-    logger.debug({ sha: commit.sha.slice(0, 7) }, 'Summarizing commit');
+    logger.info({ 
+      sha: commit.sha.slice(0, 7),
+      messagePreview: commit.message.slice(0, 100),
+      hasDiff: !!commit.diff,
+      hasPrDescription: !!commit.prDescription,
+      prLabels: commit.prLabels,
+    }, 'Calling LLM to summarize commit');
 
-    const result = await this.llm.generateObject({
-      schema: CommitSummarySchema,
-      messages: [
-        { role: 'system', content: RELEASE_NOTES_SYSTEM_PROMPT },
-        { role: 'user', content: buildCommitSummaryPrompt(commit) },
-      ],
-      temperature: 0.3,
-    });
+    try {
+      const result = await this.llm.generateObject({
+        schema: CommitSummarySchema,
+        messages: [
+          { role: 'system', content: RELEASE_NOTES_SYSTEM_PROMPT },
+          { role: 'user', content: buildCommitSummaryPrompt(commit) },
+        ],
+        temperature: 0.3,
+      });
 
-    logger.debug({ sha: commit.sha.slice(0, 7), area: result.area, type: result.type }, 'Commit summarized');
-    return result;
+      logger.info({ 
+        sha: commit.sha.slice(0, 7), 
+        area: result.area, 
+        type: result.type,
+        summaryLength: result.summary?.length,
+      }, 'LLM commit summary received');
+      return result;
+    } catch (error) {
+      logger.error({ 
+        sha: commit.sha.slice(0, 7), 
+        err: error,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      }, 'LLM summarizeCommit failed');
+      throw error;
+    }
   }
 
   /**
@@ -76,11 +96,13 @@ export class ReleaseNotesAgent {
    */
   async summarizeCommitsBatch(commits: CommitInput[]): Promise<BatchCommitSummary> {
     if (commits.length === 0) {
+      logger.info('No commits to summarize, returning empty result');
       return { summaries: [] };
     }
 
     // For small batches, process individually for better quality
     if (commits.length <= 3) {
+      logger.info({ count: commits.length }, 'Processing small batch individually for better quality');
       const summaries = await Promise.all(
         commits.map(async (c) => {
           const result = await this.summarizeCommit(c);
@@ -94,20 +116,33 @@ export class ReleaseNotesAgent {
     }
 
     // For larger batches, use batch processing
-    logger.debug({ count: commits.length }, 'Batch summarizing commits');
+    logger.info({ count: commits.length }, 'Batch summarizing commits with single LLM call');
 
-    const result = await this.llm.generateObject({
-      schema: BatchCommitSummarySchema,
-      messages: [
-        { role: 'system', content: RELEASE_NOTES_SYSTEM_PROMPT },
-        { role: 'user', content: buildBatchCommitSummaryPrompt(commits) },
-      ],
-      maxTokens: 4096,
-      temperature: 0.3,
-    });
+    try {
+      const result = await this.llm.generateObject({
+        schema: BatchCommitSummarySchema,
+        messages: [
+          { role: 'system', content: RELEASE_NOTES_SYSTEM_PROMPT },
+          { role: 'user', content: buildBatchCommitSummaryPrompt(commits) },
+        ],
+        maxTokens: 4096,
+        temperature: 0.3,
+      });
 
-    logger.debug({ count: result.summaries.length }, 'Batch summarization complete');
-    return result;
+      logger.info({ 
+        requested: commits.length, 
+        returned: result.summaries.length,
+        areas: [...new Set(result.summaries.map(s => s.area))],
+      }, 'Batch summarization complete');
+      return result;
+    } catch (error) {
+      logger.error({ 
+        count: commits.length, 
+        err: error,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      }, 'LLM batch summarization failed');
+      throw error;
+    }
   }
 
   /**
@@ -157,9 +192,18 @@ let releaseNotesAgent: ReleaseNotesAgent | null = null;
 export function getReleaseNotesAgent(): ReleaseNotesAgent | null {
   if (!releaseNotesAgent) {
     try {
+      logger.info('Attempting to create ReleaseNotesAgent...');
       releaseNotesAgent = new ReleaseNotesAgent();
+      logger.info('ReleaseNotesAgent created successfully');
     } catch (e) {
-      logger.warn({ err: e }, 'Failed to create ReleaseNotesAgent');
+      logger.error({ 
+        err: e,
+        errorMessage: e instanceof Error ? e.message : String(e),
+        llmProvider: process.env.LLM_PROVIDER ?? 'not-set',
+        llmModel: process.env.LLM_MODEL ?? 'not-set',
+        azureEndpoint: process.env.AZURE_OPENAI_ENDPOINT ? 'set' : 'not-set',
+        azureApiKey: process.env.AZURE_OPENAI_API_KEY ? 'set' : 'not-set',
+      }, 'Failed to create ReleaseNotesAgent - LLM will not be available');
       return null;
     }
   }
