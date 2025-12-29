@@ -1,0 +1,13 @@
+{
+  "name": "@release-agent/scripts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "db:migrate": "tsx migrate.ts"
+  },
+  "dependencies": {
+    "pg": "^8.13.0",
+    "tsx": "^4.20.0"
+  }
+}
+

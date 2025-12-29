@@ -1,0 +1,29 @@
+{
+  "name": "@release-agent/api",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch --env-file=.env src/index.ts",
+    "build": "node node_modules/typescript/bin/tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "lint": "node -e \"console.log('lint not configured')\""
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.0",
+    "@fastify/static": "^8.2.0",
+    "@release-agent/contracts": "workspace:*",
+    "@azure/service-bus": "^7.9.5",
+    "fastify": "^5.2.0",
+    "pg": "^8.13.0",
+    "pino": "^9.6.0",
+    "swagger-ui-dist": "^5.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.15.5",
+    "pino-pretty": "^13.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.7.0"
+  }
+}

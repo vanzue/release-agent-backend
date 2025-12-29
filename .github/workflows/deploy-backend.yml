@@ -1,0 +1,72 @@
+name: Deploy backend (ACA)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      SERVICEBUS_QUEUE_NAME: session-run
+      COMMIT_REGEN_QUEUE_NAME: commit-regen
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Container Apps extension
+        run: az extension add --name containerapp --upgrade
+
+      - name: Resolve ACR login server
+        id: acr
+        run: |
+          ACR_LOGIN_SERVER=$(az acr show -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "${{ vars.ACR_NAME }}" --query loginServer -o tsv)
+          echo "loginServer=$ACR_LOGIN_SERVER" >> $GITHUB_OUTPUT
+
+      - name: ACR login
+        run: az acr login -n "${{ vars.ACR_NAME }}"
+
+      - name: Build + push API image
+        run: |
+          docker build -f apps/api/Dockerfile -t "${{ steps.acr.outputs.loginServer }}/release-agent-api:${{ github.sha }}" .
+          docker push "${{ steps.acr.outputs.loginServer }}/release-agent-api:${{ github.sha }}"
+
+      - name: Build + push worker image
+        run: |
+          docker build -f apps/worker/Dockerfile -t "${{ steps.acr.outputs.loginServer }}/release-agent-worker:${{ github.sha }}" .
+          docker push "${{ steps.acr.outputs.loginServer }}/release-agent-worker:${{ github.sha }}"
+
+      - name: Deploy (update images + set secrets/env)
+        shell: pwsh
+        run: |
+          ./scripts/azure/deploy-containerapps.ps1 `
+            -ResourceGroup "${{ vars.AZURE_RESOURCE_GROUP }}" `
+            -AcrName "${{ vars.ACR_NAME }}" `
+            -ApiAppName "${{ vars.ACA_API_APP_NAME }}" `
+            -WorkerAppName "${{ vars.ACA_WORKER_APP_NAME }}" `
+            -ImageTag "${{ github.sha }}" `
+            -DatabaseUrl "${{ secrets.DATABASE_URL }}" `
+            -ServiceBusConnectionString "${{ secrets.SERVICEBUS_CONNECTION_STRING }}" `
+            -WorkerGitHubToken "${{ secrets.WORKER_GITHUB_TOKEN }}" `
+            -ServiceBusQueueName "${{ env.SERVICEBUS_QUEUE_NAME }}" `
+            -CommitRegenQueueName "${{ env.COMMIT_REGEN_QUEUE_NAME }}" `
+            -CorsOrigin "${{ vars.CORS_ORIGIN }}" `
+            -LlmProvider "${{ vars.LLM_PROVIDER }}" `
+            -LlmModel "${{ vars.LLM_MODEL }}" `
+            -AzureOpenAiEndpoint "${{ vars.AZURE_OPENAI_ENDPOINT }}" `
+            -AzureOpenAiApiKey "${{ secrets.AZURE_OPENAI_API_KEY }}"
