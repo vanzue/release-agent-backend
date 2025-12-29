@@ -36,6 +36,132 @@ export interface LLMClient {
 export type LLMProvider = 'azure' | 'openai' | 'anthropic' | 'google';
 
 /**
+ * Retry configuration for LLM calls.
+ */
+interface RetryConfig {
+  maxAttempts: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+  backoffMultiplier: number;
+}
+
+const DEFAULT_RETRY_CONFIG: RetryConfig = {
+  maxAttempts: 3,
+  initialDelayMs: 1000,
+  maxDelayMs: 30000,
+  backoffMultiplier: 2,
+};
+
+/**
+ * Check if an error is retryable (rate limits, server errors).
+ */
+function isRetryableError(error: unknown): boolean {
+  if (error instanceof Error) {
+    const message = error.message.toLowerCase();
+    const name = error.name.toLowerCase();
+    
+    // Rate limit errors (429)
+    if (message.includes('rate limit') || message.includes('429') || message.includes('too many requests')) {
+      return true;
+    }
+    
+    // Server errors (5xx)
+    if (message.includes('500') || message.includes('502') || message.includes('503') || message.includes('504')) {
+      return true;
+    }
+    
+    // Timeout errors
+    if (message.includes('timeout') || message.includes('timed out') || name.includes('timeout')) {
+      return true;
+    }
+    
+    // Network errors
+    if (message.includes('econnreset') || message.includes('econnrefused') || message.includes('network')) {
+      return true;
+    }
+
+    // Check for status property on error object (some SDKs add this)
+    const errorWithStatus = error as Error & { status?: number; statusCode?: number };
+    const status = errorWithStatus.status ?? errorWithStatus.statusCode;
+    if (status === 429 || (status && status >= 500 && status < 600)) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+/**
+ * Extract retry-after delay from error if present.
+ */
+function getRetryAfterMs(error: unknown): number | null {
+  if (error instanceof Error) {
+    const errorWithHeaders = error as Error & { headers?: Record<string, string> };
+    const retryAfter = errorWithHeaders.headers?.['retry-after'];
+    if (retryAfter) {
+      const seconds = parseInt(retryAfter, 10);
+      if (!isNaN(seconds)) {
+        return seconds * 1000;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Sleep for a given number of milliseconds.
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Execute a function with retry logic for transient failures.
+ */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  config: RetryConfig = DEFAULT_RETRY_CONFIG,
+  context?: string
+): Promise<T> {
+  let lastError: Error | undefined;
+  let delay = config.initialDelayMs;
+
+  for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      
+      // Don't retry if it's not a retryable error or we've exhausted attempts
+      if (!isRetryableError(error) || attempt === config.maxAttempts) {
+        logger.error(
+          { err: lastError, attempt, maxAttempts: config.maxAttempts, context },
+          'LLM call failed (not retrying)'
+        );
+        throw lastError;
+      }
+
+      // Check for retry-after header
+      const retryAfterMs = getRetryAfterMs(error);
+      const actualDelay = retryAfterMs ? Math.min(retryAfterMs, config.maxDelayMs) : delay;
+
+      logger.warn(
+        { err: lastError, attempt, maxAttempts: config.maxAttempts, delayMs: actualDelay, context },
+        'LLM call failed, retrying...'
+      );
+
+      await sleep(actualDelay);
+      
+      // Exponential backoff for next attempt
+      delay = Math.min(delay * config.backoffMultiplier, config.maxDelayMs);
+    }
+  }
+
+  // This should never be reached, but TypeScript needs it
+  throw lastError ?? new Error('Retry failed');
+}
+
+/**
  * Create the appropriate model based on LLM_PROVIDER env var.
  * 
  * Environment variables by provider:
@@ -161,12 +287,19 @@ export function createLLMClient(): LLMClient | null {
     async chat(options: ChatCompletionOptions): Promise<string> {
       logger.debug({ messageCount: options.messages.length }, 'Sending chat request');
 
-      const { text } = await generateText({
-        model,
-        messages: options.messages,
-        maxOutputTokens: options.maxTokens ?? 4096,
-        temperature: options.temperature ?? 0.7,
-      });
+      const text = await withRetry(
+        async () => {
+          const result = await generateText({
+            model,
+            messages: options.messages,
+            maxOutputTokens: options.maxTokens ?? 4096,
+            temperature: options.temperature ?? 0.7,
+          });
+          return result.text;
+        },
+        DEFAULT_RETRY_CONFIG,
+        'chat'
+      );
 
       logger.debug({ responseLength: text.length }, 'Received chat response');
       return text;
@@ -180,13 +313,20 @@ export function createLLMClient(): LLMClient | null {
     }): Promise<T> {
       logger.debug({ messageCount: options.messages.length }, 'Sending structured output request');
 
-      const { object } = await generateObject({
-        model,
-        schema: options.schema,
-        messages: options.messages,
-        maxOutputTokens: options.maxTokens ?? 4096,
-        temperature: options.temperature ?? 0.3,
-      });
+      const object = await withRetry(
+        async () => {
+          const result = await generateObject({
+            model,
+            schema: options.schema,
+            messages: options.messages,
+            maxOutputTokens: options.maxTokens ?? 4096,
+            temperature: options.temperature ?? 0.3,
+          });
+          return result.object;
+        },
+        DEFAULT_RETRY_CONFIG,
+        'generateObject'
+      );
 
       logger.debug('Received structured output response');
       return object;
