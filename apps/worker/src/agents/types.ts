@@ -93,7 +93,15 @@ export interface CommitInput {
   sha: string;
   message: string;
   author: string | null;
-  diff?: string; // Optional: full diff content
+  diff?: string; // Optional: full diff content for small changes
+  // PR context (if commit is associated with a PR)
+  prNumber?: number;
+  prTitle?: string;
+  prDescription?: string; // PR body/description for large PRs
+  prLabels?: string[];
+  filesChanged?: number;
+  additions?: number;
+  deletions?: number;
 }
 
 export interface PRInput {

@@ -108,21 +108,42 @@ export async function runSession(db: Db, sessionId: string) {
     const existingSummaries = await getCommitSummaries(db, repoFullName, commits.map((c) => c.sha));
     logger.info({ sessionId, existing: existingSummaries.size, total: commits.length }, 'Found existing commit summaries');
 
-    // Get PR info for each commit
-    const commitToPr = new Map<string, number>();
+    // Get PR info for each commit (including full PR details)
+    const commitToPrDetails = new Map<string, {
+      number: number;
+      title: string;
+      body: string | null;
+      labels: string[];
+      additions: number;
+      deletions: number;
+      filesChanged: number;
+    }>();
+    
     await Promise.all(
       commits.map(async (c) => {
         try {
           const pulls = await listPullsForCommit(repoFullName, c.sha);
-          const pr = pulls?.[0];
-          if (pr?.number) {
-            commitToPr.set(c.sha, pr.number);
+          const prBasic = pulls?.[0];
+          if (prBasic?.number) {
+            // Fetch full PR details including body/description
+            const prFull = await getPullRequest(repoFullName, prBasic.number);
+            commitToPrDetails.set(c.sha, {
+              number: prFull.number,
+              title: prFull.title,
+              body: prFull.body,
+              labels: prFull.labels.map(l => l.name),
+              additions: prFull.additions,
+              deletions: prFull.deletions,
+              filesChanged: prFull.changed_files,
+            });
           }
         } catch {
-          // ignore
+          // ignore - some commits may not have associated PRs
         }
       })
     );
+    
+    logger.info({ sessionId, commitsWithPR: commitToPrDetails.size, total: commits.length }, 'Fetched PR details');
 
     // Get ReleaseNotesAgent for LLM-powered summaries
     const releaseNotesAgent = getReleaseNotesAgent();
@@ -136,13 +157,56 @@ export async function runSession(db: Db, sessionId: string) {
       if (cached) {
         cachedResults.push({ sha: c.sha, summaryText: cached.summaryText, area: 'General' });
       } else {
-        commitsToProcess.push({
+        const prDetails = commitToPrDetails.get(c.sha);
+        const commitInput: CommitInput = {
           sha: c.sha,
           message: c.commit.message,
           author: c.author?.login ?? null,
-        });
+        };
+        
+        // Add PR context if available
+        if (prDetails) {
+          commitInput.prNumber = prDetails.number;
+          commitInput.prTitle = prDetails.title;
+          commitInput.prDescription = prDetails.body ?? undefined;
+          commitInput.prLabels = prDetails.labels;
+          commitInput.filesChanged = prDetails.filesChanged;
+          commitInput.additions = prDetails.additions;
+          commitInput.deletions = prDetails.deletions;
+        }
+        
+        commitsToProcess.push(commitInput);
       }
     }
+
+    // For small changes without PR description, fetch diff for better context
+    const SMALL_CHANGE_THRESHOLD = 10; // files
+    const SMALL_LINES_THRESHOLD = 500; // total lines changed
+    
+    await Promise.all(
+      commitsToProcess.map(async (c) => {
+        const isSmallChange = (c.filesChanged ?? 0) <= SMALL_CHANGE_THRESHOLD && 
+                             ((c.additions ?? 0) + (c.deletions ?? 0)) <= SMALL_LINES_THRESHOLD;
+        const hasDescription = c.prDescription && c.prDescription.length > 50;
+        
+        // Fetch diff for small changes without good description
+        if (isSmallChange && !hasDescription) {
+          try {
+            const diff = await getCommitDiff(repoFullName, c.sha);
+            c.diff = diff;
+          } catch {
+            // ignore - diff fetch failed
+          }
+        }
+      })
+    );
+    
+    logger.info({ 
+      sessionId, 
+      toProcess: commitsToProcess.length,
+      withDiff: commitsToProcess.filter(c => c.diff).length,
+      withPrDescription: commitsToProcess.filter(c => c.prDescription).length,
+    }, 'Prepared commits with context for LLM');
 
     // Process new commits with LLM if available
     let newResults: Array<{ sha: string; summaryText: string; area: string }> = [];
@@ -158,7 +222,8 @@ export async function runSession(db: Db, sessionId: string) {
           for (const summary of batchResult.summaries) {
             const commit = commits.find(c => c.sha === summary.commitSha);
             const creditedLogin = commit?.author?.login ?? null;
-            const prNumber = commitToPr.get(summary.commitSha) ?? null;
+            const prDetails = commitToPrDetails.get(summary.commitSha);
+            const prNumber = prDetails?.number ?? null;
             
             // Format the summary with thanks and PR link
             const formattedText = formatReleaseNote(summary.summary, {
@@ -204,7 +269,7 @@ export async function runSession(db: Db, sessionId: string) {
             commitSha: c.sha,
             summaryText,
             creditedLogin: c.author,
-            prNumber: commitToPr.get(c.sha) ?? null,
+            prNumber: commitToPrDetails.get(c.sha)?.number ?? null,
           });
 
           newResults.push({ sha: c.sha, summaryText, area: 'General' });

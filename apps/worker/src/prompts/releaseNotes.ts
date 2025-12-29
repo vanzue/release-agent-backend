@@ -37,7 +37,10 @@ If the change doesn't clearly belong to a specific tool, use:
 - "General" as last resort`;
 
 /**
- * Build user prompt for summarizing a single commit
+ * Build user prompt for summarizing a single commit.
+ * Strategy:
+ * - For large PRs (many files/changes): use PR description as context
+ * - For small changes: use diff directly for detailed understanding
  */
 export function buildCommitSummaryPrompt(commit: CommitInput): string {
   let prompt = `Summarize this commit for release notes:
@@ -47,13 +50,44 @@ Author: ${commit.author ?? 'unknown'}
 Message:
 ${commit.message}`;
 
-  if (commit.diff) {
-    // Truncate diff if too long
+  // Add PR context if available
+  if (commit.prNumber) {
+    prompt += `\n\nAssociated PR: #${commit.prNumber}`;
+    if (commit.prTitle) {
+      prompt += `\nPR Title: ${commit.prTitle}`;
+    }
+    if (commit.prLabels && commit.prLabels.length > 0) {
+      prompt += `\nLabels: ${commit.prLabels.join(', ')}`;
+    }
+    if (commit.filesChanged !== undefined) {
+      prompt += `\nFiles changed: ${commit.filesChanged} (+${commit.additions ?? 0}/-${commit.deletions ?? 0})`;
+    }
+  }
+
+  // For large PRs, prefer PR description; for small changes, use diff
+  const isLargePR = (commit.filesChanged ?? 0) > 10 || (commit.additions ?? 0) + (commit.deletions ?? 0) > 500;
+  
+  if (isLargePR && commit.prDescription) {
+    // Large PR: use description which typically summarizes the changes well
+    const maxDescLength = 2000;
+    const truncatedDesc = commit.prDescription.length > maxDescLength
+      ? commit.prDescription.slice(0, maxDescLength) + '\n... (truncated)'
+      : commit.prDescription;
+    prompt += `\n\nPR Description:\n${truncatedDesc}`;
+  } else if (commit.diff) {
+    // Small change: use diff for detailed context
     const maxDiffLength = 3000;
     const truncatedDiff = commit.diff.length > maxDiffLength 
       ? commit.diff.slice(0, maxDiffLength) + '\n... (truncated)'
       : commit.diff;
     prompt += `\n\nDiff:\n${truncatedDiff}`;
+  } else if (commit.prDescription) {
+    // Fallback: use description if no diff available
+    const maxDescLength = 2000;
+    const truncatedDesc = commit.prDescription.length > maxDescLength
+      ? commit.prDescription.slice(0, maxDescLength) + '\n... (truncated)'
+      : commit.prDescription;
+    prompt += `\n\nPR Description:\n${truncatedDesc}`;
   }
 
   return prompt;
@@ -82,16 +116,60 @@ ${filesList}${pr.files.length > 20 ? '\n  ... and more' : ''}`;
 }
 
 /**
- * Build user prompt for batch summarizing commits
+ * Build user prompt for batch summarizing commits.
+ * Includes PR context when available for better understanding.
  */
 export function buildBatchCommitSummaryPrompt(commits: CommitInput[]): string {
-  const commitsList = commits.map((c, i) => 
-    `[${i + 1}] SHA: ${c.sha.slice(0, 7)}
+  const commitsList = commits.map((c, i) => {
+    let entry = `[${i + 1}] SHA: ${c.sha.slice(0, 7)}
 Author: ${c.author ?? 'unknown'}
-Message: ${c.message.split('\n')[0]}`
-  ).join('\n\n');
+Message: ${c.message.split('\n')[0]}`;
+
+    // Add PR context if available
+    if (c.prNumber) {
+      entry += `\nPR: #${c.prNumber}`;
+      if (c.prTitle && c.prTitle !== c.message.split('\n')[0]) {
+        entry += ` - ${c.prTitle}`;
+      }
+      if (c.prLabels && c.prLabels.length > 0) {
+        entry += `\nLabels: ${c.prLabels.join(', ')}`;
+      }
+      if (c.filesChanged !== undefined) {
+        entry += `\nScope: ${c.filesChanged} files (+${c.additions ?? 0}/-${c.deletions ?? 0})`;
+      }
+    }
+
+    // Add context based on size
+    const isLargePR = (c.filesChanged ?? 0) > 10 || (c.additions ?? 0) + (c.deletions ?? 0) > 500;
+    if (isLargePR && c.prDescription) {
+      // For large PRs, include truncated description
+      const maxDescLength = 500; // Shorter for batch mode
+      const truncatedDesc = c.prDescription.length > maxDescLength
+        ? c.prDescription.slice(0, maxDescLength) + '...'
+        : c.prDescription;
+      entry += `\nDescription: ${truncatedDesc}`;
+    } else if (c.diff) {
+      // For small changes, include truncated diff
+      const maxDiffLength = 800; // Shorter for batch mode
+      const truncatedDiff = c.diff.length > maxDiffLength
+        ? c.diff.slice(0, maxDiffLength) + '...'
+        : c.diff;
+      entry += `\nDiff:\n${truncatedDiff}`;
+    } else if (c.prDescription) {
+      // Fallback to description
+      const maxDescLength = 500;
+      const truncatedDesc = c.prDescription.length > maxDescLength
+        ? c.prDescription.slice(0, maxDescLength) + '...'
+        : c.prDescription;
+      entry += `\nDescription: ${truncatedDesc}`;
+    }
+
+    return entry;
+  }).join('\n\n---\n\n');
 
   return `Summarize these ${commits.length} commits for release notes. For each commit, provide a summary, area, and type.
+
+IMPORTANT: Generate user-friendly summaries that explain WHAT changed and WHY it matters, not just repeat the commit message.
 
 ${commitsList}`;
 }

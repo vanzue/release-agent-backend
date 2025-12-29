@@ -23,6 +23,7 @@ export type PullRequestLabel = { name: string };
 export type PullRequest = {
   number: number;
   title: string;
+  body: string | null;
   user: GithubUser | null;
   additions: number;
   deletions: number;
