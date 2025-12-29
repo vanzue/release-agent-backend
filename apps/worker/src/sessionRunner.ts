@@ -520,15 +520,36 @@ export async function regenerateCommitSummary(db: Db, request: RegenerateRelease
       throw new Error(`Commit ${commitSha} not found`);
     }
 
-    // Get PR association for credited login
+    // Get PR association and full PR details for context
     let creditedLogin = commit.author?.login ?? null;
     let prNumber: number | null = null;
+    let prDetails: {
+      number: number;
+      title: string;
+      body: string | null;
+      labels: string[];
+      additions: number;
+      deletions: number;
+      filesChanged: number;
+    } | null = null;
+    
     try {
       const pulls = await listPullsForCommit(repoFullName, commitSha);
-      const pr = pulls?.[0];
-      if (pr) {
-        creditedLogin = pr.user?.login ?? creditedLogin;
-        prNumber = pr.number ?? null;
+      const prBasic = pulls?.[0];
+      if (prBasic?.number) {
+        // Fetch full PR details including body/description
+        const prFull = await getPullRequest(repoFullName, prBasic.number);
+        creditedLogin = prFull.user?.login ?? creditedLogin;
+        prNumber = prFull.number;
+        prDetails = {
+          number: prFull.number,
+          title: prFull.title,
+          body: prFull.body,
+          labels: prFull.labels.map(l => l.name),
+          additions: prFull.additions,
+          deletions: prFull.deletions,
+          filesChanged: prFull.changed_files,
+        };
       }
     } catch {
       // Ignore PR lookup failures
@@ -561,15 +582,35 @@ export async function regenerateCommitSummary(db: Db, request: RegenerateRelease
           // Diff not available, continue without it
         }
 
-        logger.info({ sessionId, commitSha }, 'Regenerating with LLM');
+        logger.info({ 
+          sessionId, 
+          commitSha,
+          hasPrDetails: !!prDetails,
+          hasDiff: !!diff,
+        }, 'Regenerating with LLM');
+        
+        // Build CommitInput with full PR context (same as batch generation)
+        const commitInput: CommitInput = {
+          sha: commitSha,
+          message: commit.commit.message,
+          author: creditedLogin,
+          diff,
+        };
+        
+        // Add PR context if available
+        if (prDetails) {
+          commitInput.prNumber = prDetails.number;
+          commitInput.prTitle = prDetails.title;
+          commitInput.prDescription = prDetails.body ?? undefined;
+          commitInput.prLabels = prDetails.labels;
+          commitInput.filesChanged = prDetails.filesChanged;
+          commitInput.additions = prDetails.additions;
+          commitInput.deletions = prDetails.deletions;
+        }
+        
         const result = await releaseNotesAgent.regenerate(
           currentText,
-          {
-            sha: commitSha,
-            message: commit.commit.message,
-            author: creditedLogin,
-            diff,
-          }
+          commitInput
         );
         
         // Format with thanks and PR link

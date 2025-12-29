@@ -193,7 +193,31 @@ Author: ${commit.author ?? 'unknown'}
 Message:
 ${commit.message}`;
 
-  if (commit.diff) {
+  // Add PR context if available (for better understanding)
+  if (commit.prNumber) {
+    prompt += `\n\nPull Request: #${commit.prNumber}`;
+    if (commit.prTitle) {
+      prompt += `\nPR Title: ${commit.prTitle}`;
+    }
+    if (commit.prLabels && commit.prLabels.length > 0) {
+      prompt += `\nLabels: ${commit.prLabels.join(', ')}`;
+    }
+    if (commit.filesChanged !== undefined) {
+      prompt += `\nFiles changed: ${commit.filesChanged}, +${commit.additions ?? 0}/-${commit.deletions ?? 0} lines`;
+    }
+  }
+
+  // For large PRs with description, use PR description as primary context
+  const isLargePR = (commit.filesChanged ?? 0) > 10 || ((commit.additions ?? 0) + (commit.deletions ?? 0)) > 500;
+  
+  if (commit.prDescription && commit.prDescription.length > 50 && isLargePR) {
+    const maxDescLength = 2000;
+    const truncatedDesc = commit.prDescription.length > maxDescLength
+      ? commit.prDescription.slice(0, maxDescLength) + '\n... (truncated)'
+      : commit.prDescription;
+    prompt += `\n\nPR Description (use this for context on large changes):\n${truncatedDesc}`;
+  } else if (commit.diff) {
+    // For smaller changes, use diff for detailed understanding
     const maxDiffLength = 3000;
     const truncatedDiff = commit.diff.length > maxDiffLength 
       ? commit.diff.slice(0, maxDiffLength) + '\n... (truncated)'
