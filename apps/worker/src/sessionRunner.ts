@@ -25,660 +25,654 @@ const logger = pino({
       : undefined,
 });
 
-/**
- * Check if a commit message is from a merge commit.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface SessionContext {
+  db: Db;
+  sessionId: string;
+  repoFullName: string;
+  baseRef: string;
+  headRef: string;
+  // Populated by runParseChanges, reused by later jobs
+  commits: any[];
+  commitToPr: Map<string, PrDetails>;
+}
+
+interface PrDetails {
+  number: number;
+  title: string;
+  body: string | null;
+  labels: string[];
+  additions: number;
+  deletions: number;
+  filesChanged: number;
+}
+
+interface ReleaseNoteResult {
+  sha: string;
+  summaryText: string;
+  area: string;
+}
+
+type ChangesArtifact = { sessionId: string; items: any[] };
+type HotspotsArtifact = { sessionId: string; items: Hotspot[] };
+type ReleaseNotesArtifact = { sessionId: string; sections: any[] };
+type TestPlanArtifact = { sessionId: string; sections: any[] };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
 export function isMergeCommit(message: string): boolean {
   const subject = (message ?? '').split('\n')[0]?.trim() ?? '';
   return /^merge\b/i.test(subject);
 }
 
-/**
- * Run a full session: parse-changes, generate-notes, analyze-hotspots, generate-testplan.
- */
-export async function runSession(db: Db, sessionId: string) {
-  logger.info({ sessionId }, 'runSession started');
+function toChangeInputs(items: any[]): ChangeInput[] {
+  return items.map((item) => ({
+    id: item.id,
+    title: item.title,
+    number: item.number,
+    author: item.author,
+    area: item.area,
+    type: item.type,
+    risk: item.risk,
+    filesChanged: item.filesChanged,
+    additions: item.additions,
+    deletions: item.deletions,
+    signals: item.signals || [],
+  }));
+}
 
-  const loaded = await loadSession(db, sessionId);
-  if (!loaded) {
-    throw new Error('Session not found');
+function toHotspots(items: any[]): Hotspot[] {
+  return items.map((h) => ({
+    area: h.area,
+    score: h.score,
+    drivers: h.drivers,
+    contributingPrs: h.contributingPrs,
+  }));
+}
+
+async function failJob(ctx: SessionContext, job: string, error: string, skipNext?: string) {
+  await setJob(ctx.db, ctx.sessionId, job, 'failed', 0, error);
+  if (skipNext) {
+    await setJob(ctx.db, ctx.sessionId, skipNext, 'skipped', 0, 'Previous step failed');
+  }
+  await setSessionStatus(ctx.db, ctx.sessionId, 'failed');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Job 1: Parse Changes
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runParseChanges(ctx: SessionContext): Promise<ChangesArtifact> {
+  const { db, sessionId, repoFullName, baseRef, headRef } = ctx;
+
+  // Always fetch commits (needed for generate-notes even if changes are cached)
+  logger.info({ sessionId, repoFullName, baseRef, headRef }, 'Comparing commits');
+  const compare = await compareCommits(repoFullName, baseRef, headRef);
+  ctx.commits = compare.filter((c) => !isMergeCommit(c.commit.message));
+  logger.info({ sessionId, total: compare.length, filtered: ctx.commits.length }, 'Commits fetched');
+
+  // Check cache
+  const existing = await getArtifact(db, sessionId, 'changes');
+  if (existing?.items?.length > 0) {
+    logger.info({ sessionId, itemCount: existing.items.length }, 'Skipping parse-changes (cached)');
+    await setJob(db, sessionId, 'parse-changes', 'completed', 100);
+    // Still need to fetch PR details for generate-notes
+    ctx.commitToPr = await fetchCommitPrDetails(repoFullName, ctx.commits);
+    return existing;
   }
 
-  const { session, repoFullName, baseRef, headRef } = loaded;
-  await setSessionStatus(db, sessionId, 'generating');
+  await setJob(db, sessionId, 'parse-changes', 'running', 5);
 
-  // Check existing artifacts to skip completed jobs
-  const existingChanges = await getArtifact(db, sessionId, 'changes');
-  const existingReleaseNotes = await getArtifact(db, sessionId, 'release-notes');
+  // Find PRs for commits and fetch details
+  ctx.commitToPr = await fetchCommitPrDetails(repoFullName, ctx.commits);
 
-  // Job: parse-changes - PR-based view of the range
-  if (existingChanges && existingChanges.items?.length > 0) {
-    logger.info({ sessionId, itemCount: existingChanges.items.length }, 'Skipping parse-changes (cached)');
-    await setJob(db, sessionId, 'parse-changes', 'completed', 100);
-  } else {
-    await setJob(db, sessionId, 'parse-changes', 'running', 5);
+  // Fetch PR files for changes artifact
+  const prNumbers = [...new Set([...ctx.commitToPr.values()].map(p => p.number))];
+  const prsWithFiles = await Promise.all(
+    prNumbers.sort((a, b) => b - a).map(async (prNumber) => {
+      const pr = await getPullRequest(repoFullName, prNumber);
+      const files = await listPullRequestFiles(repoFullName, prNumber);
+      return { pr, files };
+    })
+  );
 
-    logger.info({ sessionId, repoFullName, baseRef, headRef }, 'Comparing commits');
-    const compare = await compareCommits(repoFullName, baseRef, headRef);
-    logger.info({ sessionId, totalCommits: compare.length }, 'Compare result');
-    const commits = compare.filter((c) => !isMergeCommit(c.commit.message));
-    logger.info({ sessionId, filteredCommits: commits.length, shas: commits.map(c => c.sha.slice(0, 7)) }, 'After filtering merge commits');
+  const artifact = buildChangesArtifact(sessionId, prsWithFiles);
+  await upsertArtifact(db, sessionId, 'changes', artifact);
+  await setSessionStats(db, sessionId, { changeCount: artifact.items.length });
+  await setJob(db, sessionId, 'parse-changes', 'completed', 100);
 
-    const prByNumber = new Map<number, { number: number; creditedLogin: string | null }>();
-    await Promise.all(
-      commits.map(async (c) => {
-        try {
-          const pulls = await listPullsForCommit(repoFullName, c.sha);
-          const pr = pulls?.[0];
-          if (pr?.number) {
-            prByNumber.set(pr.number, { number: pr.number, creditedLogin: pr.user?.login ?? null });
-          }
-        } catch {
-          // ignore
-        }
-      })
-    );
+  return artifact;
+}
 
-    const prNumbers = [...prByNumber.keys()].sort((a, b) => b - a);
-    const prsWithFiles = await Promise.all(
-      prNumbers.map(async (prNumber) => {
-        const pr = await getPullRequest(repoFullName, prNumber);
-        const files = await listPullRequestFiles(repoFullName, prNumber);
-        return { pr, files };
-      })
-    );
+// ─────────────────────────────────────────────────────────────────────────────
+// Job 2: Generate Release Notes
+// ─────────────────────────────────────────────────────────────────────────────
 
-    const changesArtifact = buildChangesArtifact(sessionId, prsWithFiles);
-    await upsertArtifact(db, sessionId, 'changes', changesArtifact);
-    await setSessionStats(db, sessionId, { changeCount: changesArtifact.items.length });
-    await setJob(db, sessionId, 'parse-changes', 'completed', 100);
-  }
+async function runGenerateNotes(ctx: SessionContext, changesArtifact: ChangesArtifact): Promise<ReleaseNotesArtifact> {
+  const { db, sessionId, repoFullName, commits, commitToPr } = ctx;
 
-  // Job: generate-notes - use ReleaseNotesAgent for LLM-powered summaries
-  if (existingReleaseNotes && existingReleaseNotes.sections?.some((s: any) => s.items?.length > 0)) {
+  const existing = await getArtifact(db, sessionId, 'release-notes');
+  if (existing?.sections?.some((s: any) => s.items?.length > 0)) {
     logger.info({ sessionId }, 'Skipping generate-notes (cached)');
     await setJob(db, sessionId, 'generate-notes', 'completed', 100);
-  } else {
-    await setJob(db, sessionId, 'generate-notes', 'running', 5);
-
-    const compare = await compareCommits(repoFullName, baseRef, headRef);
-    const commits = compare.filter((c) => !isMergeCommit(c.commit.message));
-
-    // Check for existing summaries to avoid regenerating
-    const existingSummaries = await getCommitSummaries(db, repoFullName, commits.map((c) => c.sha));
-    logger.info({ sessionId, existing: existingSummaries.size, total: commits.length }, 'Found existing commit summaries');
-
-    // Get PR info for each commit (including full PR details)
-    const commitToPrDetails = new Map<string, {
-      number: number;
-      title: string;
-      body: string | null;
-      labels: string[];
-      additions: number;
-      deletions: number;
-      filesChanged: number;
-    }>();
-    
-    await Promise.all(
-      commits.map(async (c) => {
-        try {
-          const pulls = await listPullsForCommit(repoFullName, c.sha);
-          const prBasic = pulls?.[0];
-          if (prBasic?.number) {
-            // Fetch full PR details including body/description
-            const prFull = await getPullRequest(repoFullName, prBasic.number);
-            commitToPrDetails.set(c.sha, {
-              number: prFull.number,
-              title: prFull.title,
-              body: prFull.body,
-              labels: prFull.labels.map(l => l.name),
-              additions: prFull.additions,
-              deletions: prFull.deletions,
-              filesChanged: prFull.changed_files,
-            });
-          }
-        } catch {
-          // ignore - some commits may not have associated PRs
-        }
-      })
-    );
-    
-    logger.info({ sessionId, commitsWithPR: commitToPrDetails.size, total: commits.length }, 'Fetched PR details');
-
-    // Get ReleaseNotesAgent for LLM-powered summaries
-    const releaseNotesAgent = getReleaseNotesAgent();
-    logger.info({ 
-      sessionId, 
-      llmAvailable: releaseNotesAgent !== null,
-      llmProvider: process.env.LLM_PROVIDER ?? 'azure',
-      llmModel: process.env.LLM_MODEL ?? 'not-set',
-    }, 'LLM client status');
-    
-    // Separate commits that need LLM processing from cached ones
-    const cachedResults: Array<{ sha: string; summaryText: string; area: string }> = [];
-    const commitsToProcess: CommitInput[] = [];
-    
-    for (const c of commits) {
-      const cached = existingSummaries.get(c.sha);
-      if (cached) {
-        cachedResults.push({ sha: c.sha, summaryText: cached.summaryText, area: 'General' });
-      } else {
-        const prDetails = commitToPrDetails.get(c.sha);
-        const commitInput: CommitInput = {
-          sha: c.sha,
-          message: c.commit.message,
-          author: c.author?.login ?? null,
-        };
-        
-        // Add PR context if available
-        if (prDetails) {
-          commitInput.prNumber = prDetails.number;
-          commitInput.prTitle = prDetails.title;
-          commitInput.prDescription = prDetails.body ?? undefined;
-          commitInput.prLabels = prDetails.labels;
-          commitInput.filesChanged = prDetails.filesChanged;
-          commitInput.additions = prDetails.additions;
-          commitInput.deletions = prDetails.deletions;
-        }
-        
-        commitsToProcess.push(commitInput);
-      }
-    }
-
-    // For small changes without PR description, fetch diff for better context
-    const SMALL_CHANGE_THRESHOLD = 10; // files
-    const SMALL_LINES_THRESHOLD = 500; // total lines changed
-    
-    await Promise.all(
-      commitsToProcess.map(async (c) => {
-        const isSmallChange = (c.filesChanged ?? 0) <= SMALL_CHANGE_THRESHOLD && 
-                             ((c.additions ?? 0) + (c.deletions ?? 0)) <= SMALL_LINES_THRESHOLD;
-        const hasDescription = c.prDescription && c.prDescription.length > 50;
-        
-        // Fetch diff for small changes without good description
-        if (isSmallChange && !hasDescription) {
-          try {
-            const diff = await getCommitDiff(repoFullName, c.sha);
-            c.diff = diff;
-          } catch {
-            // ignore - diff fetch failed
-          }
-        }
-      })
-    );
-    
-    logger.info({ 
-      sessionId, 
-      toProcess: commitsToProcess.length,
-      withDiff: commitsToProcess.filter(c => c.diff).length,
-      withPrDescription: commitsToProcess.filter(c => c.prDescription).length,
-    }, 'Prepared commits with context for LLM');
-
-    // Process new commits with LLM if available
-    let newResults: Array<{ sha: string; summaryText: string; area: string }> = [];
-    
-    if (commitsToProcess.length > 0) {
-      if (releaseNotesAgent) {
-        try {
-          logger.info({ 
-            sessionId, 
-            count: commitsToProcess.length,
-            sampleCommit: commitsToProcess[0] ? {
-              sha: commitsToProcess[0].sha.slice(0, 7),
-              hasPrDescription: !!commitsToProcess[0].prDescription,
-              hasDiff: !!commitsToProcess[0].diff,
-              prLabels: commitsToProcess[0].prLabels,
-            } : null,
-          }, 'Starting LLM release notes generation');
-          
-          const batchResult = await releaseNotesAgent.summarizeCommitsBatch(commitsToProcess);
-          
-          logger.info({ 
-            sessionId, 
-            summariesReturned: batchResult.summaries.length,
-            sampleSummary: batchResult.summaries[0] ? {
-              sha: batchResult.summaries[0].commitSha?.slice(0, 7),
-              area: batchResult.summaries[0].area,
-              type: batchResult.summaries[0].type,
-              summaryLength: batchResult.summaries[0].summary?.length,
-            } : null,
-          }, 'LLM returned batch results');
-          
-          // Save summaries to database and build results
-          for (const summary of batchResult.summaries) {
-            // LLM returns short SHA (7 chars), need to match with full SHA using startsWith
-            const commit = commits.find(c => c.sha.startsWith(summary.commitSha));
-            const fullSha = commit?.sha ?? summary.commitSha; // Use full SHA if found
-            const creditedLogin = commit?.author?.login ?? null;
-            const prDetails = commitToPrDetails.get(fullSha);
-            const prNumber = prDetails?.number ?? null;
-            
-            // Format the summary with thanks and PR link
-            const formattedText = formatReleaseNote(summary.summary, {
-              creditedLogin,
-              prNumber,
-              repoFullName,
-            });
-            
-            await upsertCommitSummary(db, {
-              repoFullName,
-              commitSha: fullSha,
-              summaryText: formattedText,
-              creditedLogin,
-              prNumber,
-            });
-            
-            newResults.push({
-              sha: fullSha,
-              summaryText: formattedText,
-              area: summary.area,
-            });
-          }
-          
-          logger.info({ sessionId, generated: newResults.length }, 'LLM release notes generation complete');
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          const errorStack = error instanceof Error ? error.stack : undefined;
-          logger.error({ 
-            err: error, 
-            sessionId, 
-            errorMessage,
-            errorStack,
-            errorName: error instanceof Error ? error.name : 'unknown',
-          }, 'LLM release notes generation failed');
-          await setJob(db, sessionId, 'generate-notes', 'failed', 0, errorMessage);
-          await setSessionStatus(db, sessionId, 'failed');
-          throw new Error(`LLM release notes generation failed: ${errorMessage}`);
-        }
-      } else {
-        // Fallback to simple extraction if LLM not available
-        logger.warn({ 
-          sessionId,
-          llmProvider: process.env.LLM_PROVIDER ?? 'not-set',
-          llmModel: process.env.LLM_MODEL ?? 'not-set',
-          azureEndpoint: process.env.AZURE_OPENAI_ENDPOINT ? 'set' : 'not-set',
-          azureApiKey: process.env.AZURE_OPENAI_API_KEY ? 'set' : 'not-set',
-        }, 'LLM not configured, using simple commit message extraction - CHECK ENV VARS');
-        
-        for (const c of commitsToProcess) {
-          const commit = commits.find(cm => cm.sha === c.sha);
-          const summaryText = commitToReleaseNoteText(c.message, c.author);
-          if (!summaryText) continue;
-
-          await upsertCommitSummary(db, {
-            repoFullName,
-            commitSha: c.sha,
-            summaryText,
-            creditedLogin: c.author,
-            prNumber: commitToPrDetails.get(c.sha)?.number ?? null,
-          });
-
-          newResults.push({ sha: c.sha, summaryText, area: 'General' });
-        }
-      }
-    }
-
-    // Combine cached and new results
-    const allResults = [...cachedResults, ...newResults];
-
-    // Group items by area
-    const itemsByArea = new Map<string, Array<{ id: string; text: string; source: { kind: string; ref: string }; excluded: boolean }>>();
-    for (const r of allResults) {
-      const item = {
-        id: r.sha,
-        text: r.summaryText,
-        source: { kind: 'commit' as const, ref: r.sha },
-        excluded: false,
-      };
-      const existing = itemsByArea.get(r.area) || [];
-      existing.push(item);
-      itemsByArea.set(r.area, existing);
-    }
-
-    // Convert to sections array, sorted alphabetically with General last
-    const sections = [...itemsByArea.entries()]
-      .sort(([a], [b]) => {
-        if (a === 'General') return 1;
-        if (b === 'General') return -1;
-        return a.localeCompare(b);
-      })
-      .map(([area, items]) => ({ area, items }));
-
-    const totalItems = sections.reduce((sum, s) => sum + s.items.length, 0);
-    const artifact = { sessionId, sections };
-    await upsertArtifact(db, sessionId, 'release-notes', artifact);
-    await setSessionStats(db, sessionId, { releaseNotesCount: totalItems });
-    await setJob(db, sessionId, 'generate-notes', 'completed', 100);
+    return existing;
   }
 
-  // Job: analyze-hotspots - use AnalysisAgent if available
-  const existingHotspots = await getArtifact(db, sessionId, 'hotspots');
-  if (existingHotspots && existingHotspots.items?.length > 0) {
+  await setJob(db, sessionId, 'generate-notes', 'running', 5);
+
+  // Build PR -> area mapping from Changes
+  const prToArea = new Map<number, string>();
+  for (const item of changesArtifact.items ?? []) {
+    if (item.number && item.area) prToArea.set(item.number, item.area);
+  }
+
+  // Use commits from context (already fetched in runParseChanges)
+  const existingSummaries = await getCommitSummaries(db, repoFullName, commits.map((c) => c.sha));
+
+  // Split into cached vs. to-process (commitToPr already in context)
+  const { cached, toProcess } = splitCommits(commits, existingSummaries, commitToPr, prToArea);
+
+  // Fetch diffs for small changes
+  await enrichWithDiffs(repoFullName, toProcess);
+
+  // Generate summaries
+  const newResults = await generateSummaries(ctx, toProcess, commitToPr, prToArea);
+
+  // Build artifact
+  const allResults = [...cached, ...newResults];
+  const artifact = buildReleaseNotesArtifact(sessionId, allResults);
+
+  await upsertArtifact(db, sessionId, 'release-notes', artifact);
+  await setSessionStats(db, sessionId, { releaseNotesCount: allResults.length });
+  await setJob(db, sessionId, 'generate-notes', 'completed', 100);
+
+  return artifact;
+}
+
+async function fetchCommitPrDetails(repoFullName: string, commits: any[]): Promise<Map<string, PrDetails>> {
+  const map = new Map<string, PrDetails>();
+  await Promise.all(
+    commits.map(async (c) => {
+      try {
+        const pulls = await listPullsForCommit(repoFullName, c.sha);
+        if (!pulls?.[0]?.number) return;
+        const pr = await getPullRequest(repoFullName, pulls[0].number);
+        map.set(c.sha, {
+          number: pr.number,
+          title: pr.title,
+          body: pr.body,
+          labels: pr.labels.map((l) => l.name),
+          additions: pr.additions,
+          deletions: pr.deletions,
+          filesChanged: pr.changed_files,
+        });
+      } catch { /* ignore */ }
+    })
+  );
+  return map;
+}
+
+function splitCommits(
+  commits: any[],
+  existingSummaries: Map<string, any>,
+  commitToPr: Map<string, PrDetails>,
+  prToArea: Map<number, string>
+): { cached: ReleaseNoteResult[]; toProcess: CommitInput[] } {
+  const cached: ReleaseNoteResult[] = [];
+  const toProcess: CommitInput[] = [];
+
+  for (const c of commits) {
+    const existing = existingSummaries.get(c.sha);
+    if (existing) {
+      const area = existing.prNumber ? prToArea.get(existing.prNumber) ?? 'General' : 'General';
+      cached.push({ sha: c.sha, summaryText: existing.summaryText, area });
+    } else {
+      const pr = commitToPr.get(c.sha);
+      const input: CommitInput = {
+        sha: c.sha,
+        message: c.commit.message,
+        author: c.author?.login ?? null,
+      };
+      if (pr) {
+        input.prNumber = pr.number;
+        input.prTitle = pr.title;
+        input.prDescription = pr.body ?? undefined;
+        input.prLabels = pr.labels;
+        input.filesChanged = pr.filesChanged;
+        input.additions = pr.additions;
+        input.deletions = pr.deletions;
+      }
+      toProcess.push(input);
+    }
+  }
+
+  return { cached, toProcess };
+}
+
+async function enrichWithDiffs(repoFullName: string, commits: CommitInput[]) {
+  const SMALL_FILES = 10;
+  const SMALL_LINES = 500;
+
+  await Promise.all(
+    commits.map(async (c) => {
+      const isSmall = (c.filesChanged ?? 0) <= SMALL_FILES &&
+                      ((c.additions ?? 0) + (c.deletions ?? 0)) <= SMALL_LINES;
+      const hasDesc = c.prDescription && c.prDescription.length > 50;
+      if (isSmall && !hasDesc) {
+        try { c.diff = await getCommitDiff(repoFullName, c.sha); } catch { /* ignore */ }
+      }
+    })
+  );
+}
+
+async function generateSummaries(
+  ctx: SessionContext,
+  toProcess: CommitInput[],
+  commitToPr: Map<string, PrDetails>,
+  prToArea: Map<number, string>
+): Promise<ReleaseNoteResult[]> {
+  if (toProcess.length === 0) return [];
+
+  const { db, sessionId, repoFullName, commits } = ctx;
+  const agent = getReleaseNotesAgent();
+
+  if (!agent) {
+    logger.warn({ sessionId }, 'LLM not configured, using fallback');
+    return generateFallbackSummaries(ctx, toProcess, commitToPr, prToArea);
+  }
+
+  try {
+    logger.info({ sessionId, count: toProcess.length }, 'Generating with LLM');
+    const batch = await agent.summarizeCommitsBatch(toProcess);
+    const results: ReleaseNoteResult[] = [];
+
+    for (const summary of batch.summaries) {
+      const commit = commits.find((c) => c.sha.startsWith(summary.commitSha));
+      const fullSha = commit?.sha ?? summary.commitSha;
+      const prDetails = commitToPr.get(fullSha);
+      const prNumber = prDetails?.number ?? null;
+      const creditedLogin = commit?.author?.login ?? null;
+
+      const formattedText = formatReleaseNote(summary.summary, {
+        creditedLogin,
+        prNumber,
+        repoFullName,
+      });
+
+      await upsertCommitSummary(db, {
+        repoFullName,
+        commitSha: fullSha,
+        summaryText: formattedText,
+        creditedLogin,
+        prNumber,
+      });
+
+      const area = (prNumber ? prToArea.get(prNumber) : null) ?? summary.area ?? 'General';
+      results.push({ sha: fullSha, summaryText: formattedText, area });
+    }
+
+    logger.info({ sessionId, generated: results.length }, 'LLM generation complete');
+    return results;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logger.error({ err: error, sessionId }, 'LLM generation failed');
+    await failJob(ctx, 'generate-notes', msg);
+    throw new Error(`LLM release notes generation failed: ${msg}`);
+  }
+}
+
+async function generateFallbackSummaries(
+  ctx: SessionContext,
+  toProcess: CommitInput[],
+  commitToPr: Map<string, PrDetails>,
+  prToArea: Map<number, string>
+): Promise<ReleaseNoteResult[]> {
+  const { db, repoFullName } = ctx;
+  const results: ReleaseNoteResult[] = [];
+
+  for (const c of toProcess) {
+    const text = commitToReleaseNoteText(c.message, c.author);
+    if (!text) continue;
+
+    const prNumber = commitToPr.get(c.sha)?.number ?? null;
+    await upsertCommitSummary(db, {
+      repoFullName,
+      commitSha: c.sha,
+      summaryText: text,
+      creditedLogin: c.author,
+      prNumber,
+    });
+
+    const area = (prNumber ? prToArea.get(prNumber) : null) ?? 'General';
+    results.push({ sha: c.sha, summaryText: text, area });
+  }
+
+  return results;
+}
+
+function buildReleaseNotesArtifact(sessionId: string, results: ReleaseNoteResult[]): ReleaseNotesArtifact {
+  const byArea = new Map<string, any[]>();
+  for (const r of results) {
+    const items = byArea.get(r.area) || [];
+    items.push({
+      id: r.sha,
+      text: r.summaryText,
+      source: { kind: 'commit', ref: r.sha },
+      excluded: false,
+    });
+    byArea.set(r.area, items);
+  }
+
+  const sections = [...byArea.entries()]
+    .sort(([a], [b]) => {
+      if (a === 'General') return 1;
+      if (b === 'General') return -1;
+      return a.localeCompare(b);
+    })
+    .map(([area, items]) => ({ area, items }));
+
+  return { sessionId, sections };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Job 3: Analyze Hotspots
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runAnalyzeHotspots(ctx: SessionContext, changesArtifact: ChangesArtifact): Promise<HotspotsArtifact> {
+  const { db, sessionId } = ctx;
+
+  const existing = await getArtifact(db, sessionId, 'hotspots');
+  if (existing?.items?.length > 0) {
     logger.info({ sessionId }, 'Skipping analyze-hotspots (cached)');
     await setJob(db, sessionId, 'analyze-hotspots', 'completed', 100);
-  } else {
-    await setJob(db, sessionId, 'analyze-hotspots', 'running', 5);
-    
-    const changesArtifact = await getArtifact(db, sessionId, 'changes');
-    const analysisAgent = getAnalysisAgent();
-    
-    let hotspotsArtifact: { sessionId: string; items: Hotspot[] };
-    
-    if (analysisAgent && changesArtifact?.items?.length > 0) {
-      // Convert to ChangeInput format for the agent
-      const changeInputs: ChangeInput[] = changesArtifact.items.map((item: any) => ({
-        id: item.id,
-        title: item.title,
-        number: item.number,
-        author: item.author,
-        area: item.area,
-        type: item.type,
-        risk: item.risk,
-        filesChanged: item.filesChanged,
-        additions: item.additions,
-        deletions: item.deletions,
-        signals: item.signals || [],
-      }));
-
-      try {
-        logger.info({ sessionId, changeCount: changeInputs.length }, 'Running analysis with LLM');
-        const analysis = await analysisAgent.analyzeChanges(changeInputs);
-        
-        // Convert to artifact format with rank
-        hotspotsArtifact = {
-          sessionId,
-          items: analysis.hotspots.map((h, idx) => ({
-            id: `hotspot-${idx + 1}`,
-            rank: idx + 1,
-            area: h.area,
-            score: h.score,
-            drivers: h.drivers,
-            contributingPrs: h.contributingPrs,
-          })),
-        };
-        
-        logger.info({ sessionId, hotspotCount: hotspotsArtifact.items.length }, 'LLM analysis complete');
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        logger.error({ err: error, sessionId }, 'LLM analysis failed');
-        await setJob(db, sessionId, 'analyze-hotspots', 'failed', 0, errorMessage);
-        await setJob(db, sessionId, 'generate-testplan', 'skipped', 0, 'Previous step failed');
-        await setSessionStatus(db, sessionId, 'failed');
-        throw new Error(`LLM analysis failed: ${errorMessage}`);
-      }
-    } else if (!analysisAgent) {
-      // No LLM configured - fail the job
-      logger.error({ sessionId }, 'LLM not configured for analysis');
-      await setJob(db, sessionId, 'analyze-hotspots', 'failed', 0, 'LLM not configured');
-      await setJob(db, sessionId, 'generate-testplan', 'skipped', 0, 'Previous step failed');
-      await setSessionStatus(db, sessionId, 'failed');
-      throw new Error('LLM not configured for analysis');
-    } else {
-      // No changes to analyze
-      hotspotsArtifact = { sessionId, items: [] };
-    }
-    
-    await upsertArtifact(db, sessionId, 'hotspots', hotspotsArtifact);
-    await setJob(db, sessionId, 'analyze-hotspots', 'completed', 100);
+    return existing;
   }
 
-  // Job: generate-testplan - use TestPlanAgent if available
-  const existingTestPlan = await getArtifact(db, sessionId, 'test-plan');
-  if (existingTestPlan && existingTestPlan.sections?.some((s: any) => s.cases?.length > 0)) {
-    logger.info({ sessionId }, 'Skipping generate-testplan (cached)');
-    await setJob(db, sessionId, 'generate-testplan', 'completed', 100);
-  } else {
-    await setJob(db, sessionId, 'generate-testplan', 'running', 5);
-    
-    const changesArtifact = await getArtifact(db, sessionId, 'changes');
-    const hotspotsArtifact = await getArtifact(db, sessionId, 'hotspots');
-    const testPlanAgent = getTestPlanAgent();
-    
-    let testPlanArtifact: { sessionId: string; sections: any[] };
-    
-    if (testPlanAgent && changesArtifact?.items?.length > 0) {
-      const changeInputs: ChangeInput[] = changesArtifact.items.map((item: any) => ({
-        id: item.id,
-        title: item.title,
-        number: item.number,
-        author: item.author,
-        area: item.area,
-        type: item.type,
-        risk: item.risk,
-        filesChanged: item.filesChanged,
-        additions: item.additions,
-        deletions: item.deletions,
-        signals: item.signals || [],
-      }));
-      
-      const hotspots: Hotspot[] = (hotspotsArtifact?.items || []).map((h: any) => ({
+  await setJob(db, sessionId, 'analyze-hotspots', 'running', 5);
+
+  const agent = getAnalysisAgent();
+  if (!agent) {
+    logger.error({ sessionId }, 'LLM not configured for analysis');
+    await failJob(ctx, 'analyze-hotspots', 'LLM not configured', 'generate-testplan');
+    throw new Error('LLM not configured for analysis');
+  }
+
+  if (!changesArtifact.items?.length) {
+    const artifact: HotspotsArtifact = { sessionId, items: [] };
+    await upsertArtifact(db, sessionId, 'hotspots', artifact);
+    await setJob(db, sessionId, 'analyze-hotspots', 'completed', 100);
+    return artifact;
+  }
+
+  try {
+    logger.info({ sessionId, changeCount: changesArtifact.items.length }, 'Analyzing hotspots');
+    const analysis = await agent.analyzeChanges(toChangeInputs(changesArtifact.items));
+
+    const artifact: HotspotsArtifact = {
+      sessionId,
+      items: analysis.hotspots.map((h, idx) => ({
+        id: `hotspot-${idx + 1}`,
+        rank: idx + 1,
         area: h.area,
         score: h.score,
         drivers: h.drivers,
         contributingPrs: h.contributingPrs,
-      }));
+      })),
+    };
 
-      try {
-        logger.info({ sessionId, changeCount: changeInputs.length }, 'Generating test plan with LLM');
-        const testPlan = await testPlanAgent.generateTestPlan(changeInputs, hotspots);
-        
-        testPlanArtifact = {
-          sessionId,
-          sections: testPlan.sections.map(s => ({
-            area: s.area,
-            cases: s.cases.map(c => ({
-              id: c.id,
-              text: c.text,
-              checked: false,
-              priority: c.priority,
-              source: c.source,
-            })),
-          })),
-        };
-        
-        logger.info({ 
-          sessionId, 
-          sectionCount: testPlanArtifact.sections.length,
-          totalCases: testPlanArtifact.sections.reduce((sum, s) => sum + s.cases.length, 0),
-        }, 'LLM test plan generation complete');
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        logger.error({ err: error, sessionId }, 'LLM test plan generation failed');
-        await setJob(db, sessionId, 'generate-testplan', 'failed', 0, errorMessage);
-        await setSessionStatus(db, sessionId, 'failed');
-        throw new Error(`LLM test plan generation failed: ${errorMessage}`);
-      }
-    } else if (!testPlanAgent) {
-      // No LLM configured - fail the job
-      logger.error({ sessionId }, 'LLM not configured for test plan generation');
-      await setJob(db, sessionId, 'generate-testplan', 'failed', 0, 'LLM not configured');
-      await setSessionStatus(db, sessionId, 'failed');
-      throw new Error('LLM not configured for test plan generation');
-    } else {
-      // No changes - empty test plan
-      testPlanArtifact = { sessionId, sections: [] };
-    }
-    
-    await upsertArtifact(db, sessionId, 'test-plan', testPlanArtifact);
-    await setJob(db, sessionId, 'generate-testplan', 'completed', 100);
+    await upsertArtifact(db, sessionId, 'hotspots', artifact);
+    await setJob(db, sessionId, 'analyze-hotspots', 'completed', 100);
+    logger.info({ sessionId, hotspotCount: artifact.items.length }, 'Analysis complete');
+
+    return artifact;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logger.error({ err: error, sessionId }, 'Analysis failed');
+    await failJob(ctx, 'analyze-hotspots', msg, 'generate-testplan');
+    throw new Error(`LLM analysis failed: ${msg}`);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Job 4: Generate Test Plan
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runGenerateTestPlan(
+  ctx: SessionContext,
+  changesArtifact: ChangesArtifact,
+  hotspotsArtifact: HotspotsArtifact
+): Promise<TestPlanArtifact> {
+  const { db, sessionId } = ctx;
+
+  const existing = await getArtifact(db, sessionId, 'test-plan');
+  if (existing?.sections?.some((s: any) => s.cases?.length > 0)) {
+    logger.info({ sessionId }, 'Skipping generate-testplan (cached)');
+    await setJob(db, sessionId, 'generate-testplan', 'completed', 100);
+    return existing;
+  }
+
+  await setJob(db, sessionId, 'generate-testplan', 'running', 5);
+
+  const agent = getTestPlanAgent();
+  if (!agent) {
+    logger.error({ sessionId }, 'LLM not configured for test plan');
+    await failJob(ctx, 'generate-testplan', 'LLM not configured');
+    throw new Error('LLM not configured for test plan generation');
+  }
+
+  if (!changesArtifact.items?.length) {
+    const artifact: TestPlanArtifact = { sessionId, sections: [] };
+    await upsertArtifact(db, sessionId, 'test-plan', artifact);
+    await setJob(db, sessionId, 'generate-testplan', 'completed', 100);
+    return artifact;
+  }
+
+  try {
+    const changeInputs = toChangeInputs(changesArtifact.items);
+    const hotspots = toHotspots(hotspotsArtifact.items ?? []);
+
+    logger.info({ sessionId, changeCount: changeInputs.length }, 'Generating test plan');
+    const testPlan = await agent.generateTestPlan(changeInputs, hotspots);
+
+    const artifact: TestPlanArtifact = {
+      sessionId,
+      sections: testPlan.sections.map((s) => ({
+        area: s.area,
+        cases: s.cases.map((c) => ({
+          id: c.id,
+          text: c.text,
+          checked: false,
+          priority: c.priority,
+          source: c.source,
+        })),
+      })),
+    };
+
+    await upsertArtifact(db, sessionId, 'test-plan', artifact);
+    await setJob(db, sessionId, 'generate-testplan', 'completed', 100);
+    logger.info({ sessionId, sections: artifact.sections.length }, 'Test plan complete');
+
+    return artifact;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logger.error({ err: error, sessionId }, 'Test plan generation failed');
+    await failJob(ctx, 'generate-testplan', msg);
+    throw new Error(`LLM test plan generation failed: ${msg}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main Entry Point
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function runSession(db: Db, sessionId: string) {
+  logger.info({ sessionId }, 'Session started');
+
+  const loaded = await loadSession(db, sessionId);
+  if (!loaded) throw new Error('Session not found');
+
+  const ctx: SessionContext = {
+    db,
+    sessionId,
+    repoFullName: loaded.repoFullName,
+    baseRef: loaded.baseRef,
+    headRef: loaded.headRef,
+    commits: [],
+    commitToPr: new Map(),
+  };
+
+  await setSessionStatus(db, sessionId, 'generating');
+
+  const changesArtifact = await runParseChanges(ctx);
+  await runGenerateNotes(ctx, changesArtifact);
+  const hotspotsArtifact = await runAnalyzeHotspots(ctx, changesArtifact);
+  await runGenerateTestPlan(ctx, changesArtifact, hotspotsArtifact);
 
   await setSessionStatus(db, sessionId, 'ready');
   logger.info({ sessionId }, 'Session completed');
 }
 
-/**
- * Regenerate a single commit summary using LLM if available.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// Regenerate Single Item
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function regenerateCommitSummary(db: Db, request: RegenerateReleaseNoteRequest) {
   const { sessionId, itemId, commitSha, repoFullName } = request;
-
   logger.info({ sessionId, itemId, commitSha }, 'Regenerating commit summary');
 
   try {
-    // Fetch the commit to get message and author info
     const commit = await getCommit(repoFullName, commitSha);
-    if (!commit) {
-      throw new Error(`Commit ${commitSha} not found`);
-    }
+    if (!commit) throw new Error(`Commit ${commitSha} not found`);
 
-    // Get PR association and full PR details for context
-    let creditedLogin = commit.author?.login ?? null;
-    let prNumber: number | null = null;
-    let prDetails: {
-      number: number;
-      title: string;
-      body: string | null;
-      labels: string[];
-      additions: number;
-      deletions: number;
-      filesChanged: number;
-    } | null = null;
-    
-    try {
-      const pulls = await listPullsForCommit(repoFullName, commitSha);
-      const prBasic = pulls?.[0];
-      if (prBasic?.number) {
-        // Fetch full PR details including body/description
-        const prFull = await getPullRequest(repoFullName, prBasic.number);
-        creditedLogin = prFull.user?.login ?? creditedLogin;
-        prNumber = prFull.number;
-        prDetails = {
-          number: prFull.number,
-          title: prFull.title,
-          body: prFull.body,
-          labels: prFull.labels.map(l => l.name),
-          additions: prFull.additions,
-          deletions: prFull.deletions,
-          filesChanged: prFull.changed_files,
-        };
-      }
-    } catch {
-      // Ignore PR lookup failures
-    }
-
-    // Get current text for context
+    const { creditedLogin, prNumber, prDetails } = await fetchPrForCommit(repoFullName, commitSha, commit);
     const artifact = await getArtifact(db, sessionId, 'release-notes');
-    let currentText = '';
-    if (artifact) {
-      for (const section of artifact.sections ?? []) {
-        const item = (section.items ?? []).find((i: any) => i.id === itemId);
-        if (item) {
-          currentText = item.text;
-          break;
-        }
-      }
-    }
+    const currentText = findItemText(artifact, itemId);
 
-    // Try to use LLM for regeneration
-    let summaryText: string;
-    const releaseNotesAgent = getReleaseNotesAgent();
-    
-    if (releaseNotesAgent) {
-      try {
-        // Try to get the commit diff for better context
-        let diff: string | undefined;
-        try {
-          diff = await getCommitDiff(repoFullName, commitSha);
-        } catch {
-          // Diff not available, continue without it
-        }
+    const summaryText = await generateSingleSummary(
+      repoFullName, commitSha, commit, prDetails, currentText, creditedLogin, prNumber
+    );
 
-        logger.info({ 
-          sessionId, 
-          commitSha,
-          hasPrDetails: !!prDetails,
-          hasDiff: !!diff,
-        }, 'Regenerating with LLM');
-        
-        // Build CommitInput with full PR context (same as batch generation)
-        const commitInput: CommitInput = {
-          sha: commitSha,
-          message: commit.commit.message,
-          author: creditedLogin,
-          diff,
-        };
-        
-        // Add PR context if available
-        if (prDetails) {
-          commitInput.prNumber = prDetails.number;
-          commitInput.prTitle = prDetails.title;
-          commitInput.prDescription = prDetails.body ?? undefined;
-          commitInput.prLabels = prDetails.labels;
-          commitInput.filesChanged = prDetails.filesChanged;
-          commitInput.additions = prDetails.additions;
-          commitInput.deletions = prDetails.deletions;
-        }
-        
-        const result = await releaseNotesAgent.regenerate(
-          currentText,
-          commitInput
-        );
-        
-        // Format with thanks and PR link
-        summaryText = formatReleaseNote(result.summary, {
-          creditedLogin,
-          prNumber,
-          repoFullName,
-        });
-      } catch (error) {
-        logger.warn({ err: error, sessionId, commitSha }, 'LLM regeneration failed, using fallback');
-        summaryText = commitToReleaseNoteText(commit.commit.message, creditedLogin) || currentText;
-      }
-    } else {
-      // Fallback to simple text processing
-      summaryText = commitToReleaseNoteText(commit.commit.message, creditedLogin) || currentText;
-    }
-
-    if (!summaryText) {
-      throw new Error('Failed to generate summary text');
-    }
-
-    // Update commit_summaries table
-    await upsertCommitSummary(db, {
-      repoFullName,
-      commitSha,
-      summaryText,
-      creditedLogin,
-      prNumber,
-    });
-
-    // Update the release-notes artifact
-    if (artifact) {
-      for (const section of artifact.sections ?? []) {
-        const item = (section.items ?? []).find((i: any) => i.id === itemId);
-        if (item) {
-          item.text = summaryText;
-          item.status = 'ready';
-          break;
-        }
-      }
-      await upsertArtifact(db, sessionId, 'release-notes', artifact);
-    }
-
-    // Mark as ready
+    await upsertCommitSummary(db, { repoFullName, commitSha, summaryText, creditedLogin, prNumber });
+    await updateArtifactItem(db, sessionId, artifact, itemId, summaryText);
     await setCommitSummaryStatus(db, repoFullName, commitSha, 'ready');
 
-    logger.info({ sessionId, itemId, commitSha }, 'Commit summary regeneration completed');
+    logger.info({ sessionId, itemId, commitSha }, 'Regeneration completed');
   } catch (error) {
-    logger.error({ err: error, sessionId, itemId, commitSha }, 'Commit summary regeneration failed');
-
-    // Mark as ready even on failure (so user can retry)
+    logger.error({ err: error, sessionId, itemId, commitSha }, 'Regeneration failed');
     await setCommitSummaryStatus(db, repoFullName, commitSha, 'ready');
-
-    // Update artifact status to ready on failure
-    const artifact = await getArtifact(db, sessionId, 'release-notes');
-    if (artifact) {
-      for (const section of artifact.sections ?? []) {
-        const item = (section.items ?? []).find((i: any) => i.id === itemId);
-        if (item) {
-          item.status = 'ready';
-          break;
-        }
-      }
-      await upsertArtifact(db, sessionId, 'release-notes', artifact);
-    }
-
+    await markArtifactItemReady(db, sessionId, itemId);
     throw error;
   }
+}
+
+async function fetchPrForCommit(
+  repoFullName: string,
+  commitSha: string,
+  commit: any
+): Promise<{ creditedLogin: string | null; prNumber: number | null; prDetails: PrDetails | null }> {
+  let creditedLogin = commit.author?.login ?? null;
+  let prNumber: number | null = null;
+  let prDetails: PrDetails | null = null;
+
+  try {
+    const pulls = await listPullsForCommit(repoFullName, commitSha);
+    if (pulls?.[0]?.number) {
+      const pr = await getPullRequest(repoFullName, pulls[0].number);
+      creditedLogin = pr.user?.login ?? creditedLogin;
+      prNumber = pr.number;
+      prDetails = {
+        number: pr.number,
+        title: pr.title,
+        body: pr.body,
+        labels: pr.labels.map((l) => l.name),
+        additions: pr.additions,
+        deletions: pr.deletions,
+        filesChanged: pr.changed_files,
+      };
+    }
+  } catch { /* ignore */ }
+
+  return { creditedLogin, prNumber, prDetails };
+}
+
+function findItemText(artifact: any, itemId: string): string {
+  for (const section of artifact?.sections ?? []) {
+    const item = section.items?.find((i: any) => i.id === itemId);
+    if (item) return item.text;
+  }
+  return '';
+}
+
+async function generateSingleSummary(
+  repoFullName: string,
+  commitSha: string,
+  commit: any,
+  prDetails: PrDetails | null,
+  currentText: string,
+  creditedLogin: string | null,
+  prNumber: number | null
+): Promise<string> {
+  const agent = getReleaseNotesAgent();
+  if (!agent) {
+    return commitToReleaseNoteText(commit.commit.message, creditedLogin) || currentText;
+  }
+
+  try {
+    let diff: string | undefined;
+    try { diff = await getCommitDiff(repoFullName, commitSha); } catch { /* ignore */ }
+
+    const input: CommitInput = {
+      sha: commitSha,
+      message: commit.commit.message,
+      author: creditedLogin,
+      diff,
+    };
+
+    if (prDetails) {
+      input.prNumber = prDetails.number;
+      input.prTitle = prDetails.title;
+      input.prDescription = prDetails.body ?? undefined;
+      input.prLabels = prDetails.labels;
+      input.filesChanged = prDetails.filesChanged;
+      input.additions = prDetails.additions;
+      input.deletions = prDetails.deletions;
+    }
+
+    const result = await agent.regenerate(currentText, input);
+    return formatReleaseNote(result.summary, { creditedLogin, prNumber, repoFullName });
+  } catch (error) {
+    logger.warn({ err: error, commitSha }, 'LLM regeneration failed, using fallback');
+    return commitToReleaseNoteText(commit.commit.message, creditedLogin) || currentText;
+  }
+}
+
+async function updateArtifactItem(db: Db, sessionId: string, artifact: any, itemId: string, text: string) {
+  if (!artifact) return;
+  for (const section of artifact.sections ?? []) {
+    const item = section.items?.find((i: any) => i.id === itemId);
+    if (item) {
+      item.text = text;
+      item.status = 'ready';
+      break;
+    }
+  }
+  await upsertArtifact(db, sessionId, 'release-notes', artifact);
+}
+
+async function markArtifactItemReady(db: Db, sessionId: string, itemId: string) {
+  const artifact = await getArtifact(db, sessionId, 'release-notes');
+  if (!artifact) return;
+  for (const section of artifact.sections ?? []) {
+    const item = section.items?.find((i: any) => i.id === itemId);
+    if (item) {
+      item.status = 'ready';
+      break;
+    }
+  }
+  await upsertArtifact(db, sessionId, 'release-notes', artifact);
 }
