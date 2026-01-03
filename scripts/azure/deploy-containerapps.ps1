@@ -33,6 +33,10 @@ param(
 
   [string]$ServiceBusQueueName = "session-run",
   [string]$CommitRegenQueueName = "commit-regen",
+  [string]$IssueSyncQueueName = "issue-sync",
+  [string]$IssueReclusterQueueName = "issue-recluster",
+  [int]$IssueAutoSyncIntervalMinutes = 30,
+  [string]$IssueEmbeddingModelId = "",
   [string]$CorsOrigin = "",
 
   [switch]$SkipSecrets
@@ -92,10 +96,17 @@ $workerEnvVars = @(
   "SERVICEBUS_CONNECTION_STRING=secretref:servicebus-conn",
   "SERVICEBUS_SESSION_RUN_QUEUE=$ServiceBusQueueName",
   "SERVICEBUS_COMMIT_REGEN_QUEUE=$CommitRegenQueueName",
+  "SERVICEBUS_ISSUE_SYNC_QUEUE=$IssueSyncQueueName",
+  "SERVICEBUS_ISSUE_RECLUSTER_QUEUE=$IssueReclusterQueueName",
+  "ISSUE_AUTO_SYNC_INTERVAL_MINUTES=$IssueAutoSyncIntervalMinutes",
   "LOG_LEVEL=info",
   "GITHUB_TOKEN=secretref:github-token",
   "LLM_PROVIDER=$LlmProvider"
 )
+
+if ($IssueEmbeddingModelId) {
+  $workerEnvVars += "ISSUE_EMBEDDING_MODEL_ID=$IssueEmbeddingModelId"
+}
 
 if ($LlmModel) {
   $workerEnvVars += "LLM_MODEL=$LlmModel"

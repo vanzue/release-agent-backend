@@ -1,0 +1,205 @@
+openapi: 3.0.3
+info:
+  title: Release Agent API
+  version: 0.1.0
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+  /issues/versions:
+    get:
+      summary: List issue versions for a repo
+      parameters:
+        - in: query
+          name: repo
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Versions list
+  /issues/products:
+    get:
+      summary: List products for a repo and version
+      parameters:
+        - in: query
+          name: repo
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: targetVersion
+          required: false
+          schema:
+            type: string
+            nullable: true
+      responses:
+        "200":
+          description: Product list
+  /issues/clusters:
+    get:
+      summary: List clusters for a repo/version/product
+      parameters:
+        - in: query
+          name: repo
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: productLabel
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: targetVersion
+          required: false
+          schema:
+            type: string
+            nullable: true
+      responses:
+        "200":
+          description: Cluster list
+  /issues/clusters/{clusterId}:
+    get:
+      summary: Cluster details
+      parameters:
+        - in: path
+          name: clusterId
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: repo
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Cluster details
+        "404":
+          description: Cluster not found
+  /issues/search:
+    get:
+      summary: Search issues
+      parameters:
+        - in: query
+          name: repo
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: targetVersion
+          required: false
+          schema:
+            type: string
+            nullable: true
+        - in: query
+          name: productLabels
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: state
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: clusterId
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: q
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+        - in: query
+          name: offset
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Search results
+  /issues/jobs:
+    get:
+      summary: List issue jobs
+      parameters:
+        - in: query
+          name: repo
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Job list
+  /issues/stats:
+    get:
+      summary: Issue stats (total/open/embedded)
+      parameters:
+        - in: query
+          name: repo
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Issue stats
+  /issues/sync:
+    post:
+      summary: Enqueue issue sync
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                repoFullName:
+                  type: string
+                fullSync:
+                  type: boolean
+              required:
+                - repoFullName
+      responses:
+        "202":
+          description: Queued
+  /issues/recluster:
+    post:
+      summary: Enqueue issue recluster
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                repoFullName:
+                  type: string
+                targetVersion:
+                  type: string
+                  nullable: true
+                productLabel:
+                  type: string
+                threshold:
+                  type: number
+                topK:
+                  type: number
+              required:
+                - repoFullName
+                - productLabel
+                - threshold
+                - topK
+      responses:
+        "202":
+          description: Queued

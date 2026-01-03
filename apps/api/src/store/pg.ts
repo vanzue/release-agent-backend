@@ -184,6 +184,324 @@ export function createPgStore(db: Db) {
         [row.repoFullName, row.commitSha, row.summaryText, row.creditedLogin, row.prNumber]
       );
     },
+
+    // -----------------------------
+    // Issue clustering (MVP)
+    // -----------------------------
+
+    async listIssueVersions(repoFullName: string): Promise<Array<{ targetVersion: string | null; issueCount: number }>> {
+      const res = await db.pool.query(
+        `
+        select target_version, count(*)::int as issue_count
+        from issues
+        where repo = $1 and state = 'open'
+        group by target_version
+        `,
+        [repoFullName]
+      );
+      return res.rows.map((r: any) => ({
+        targetVersion: (r.target_version as string | null) ?? null,
+        issueCount: Number(r.issue_count ?? 0),
+      }));
+    },
+
+    async listIssueProducts(input: {
+      repoFullName: string;
+      targetVersion: string | null;
+    }): Promise<Array<{ productLabel: string; issueCount: number; clusterCount: number }>> {
+      const res = await db.pool.query(
+        `
+        with product_issue_counts as (
+          select p.product_label, count(distinct i.issue_number)::int as issue_count
+          from issue_products p
+          join issues i on i.repo = p.repo and i.issue_number = p.issue_number
+          where i.repo = $1
+            and i.state = 'open'
+            and i.target_version is not distinct from $2
+          group by p.product_label
+        )
+        select
+          pic.product_label,
+          pic.issue_count,
+          (select count(*)::int from clusters c
+           where c.repo = $1
+             and c.product_label = pic.product_label) as cluster_count
+        from product_issue_counts pic
+        order by pic.issue_count desc, pic.product_label asc
+        `,
+        [input.repoFullName, input.targetVersion]
+      );
+
+      return res.rows.map((r: any) => ({
+        productLabel: r.product_label as string,
+        issueCount: Number(r.issue_count ?? 0),
+        clusterCount: Number(r.cluster_count ?? 0),
+      }));
+    },
+
+    async listIssueClusters(input: {
+      repoFullName: string;
+      productLabel: string;
+    }): Promise<
+      Array<{
+        clusterId: string;
+        size: number;
+        updatedAt: string;
+        popularity: number;
+        representativeIssueNumber: number | null;
+        representativeTitle: string | null;
+      }>
+    > {
+      const res = await db.pool.query(
+        `
+        select
+          c.cluster_id,
+          c.size,
+          c.updated_at,
+          c.popularity,
+          c.representative_issue_number,
+          i.title as representative_title
+        from clusters c
+        left join issues i on i.repo = c.repo and i.issue_number = c.representative_issue_number
+        where c.repo = $1
+          and c.product_label = $2
+        order by c.popularity desc, c.size desc, c.updated_at desc
+        `,
+        [input.repoFullName, input.productLabel]
+      );
+      return res.rows.map((r: any) => ({
+        clusterId: r.cluster_id as string,
+        size: Number(r.size ?? 0),
+        updatedAt: r.updated_at as string,
+        popularity: Number(r.popularity ?? 0),
+        representativeIssueNumber: (r.representative_issue_number as number | null) ?? null,
+        representativeTitle: (r.representative_title as string | null) ?? null,
+      }));
+    },
+
+    async getIssueCluster(input: {
+      repoFullName: string;
+      clusterId: string;
+    }): Promise<{
+      clusterId: string;
+      repoFullName: string;
+      targetVersion: string | null;
+      productLabel: string;
+      thresholdUsed: number;
+      topkUsed: number;
+      size: number;
+      popularity: number;
+      representativeIssueNumber: number | null;
+      updatedAt: string;
+    } | null> {
+      const res = await db.pool.query(
+        `
+        select *
+        from clusters
+        where repo = $1 and cluster_id = $2
+        `,
+        [input.repoFullName, input.clusterId]
+      );
+      const r = res.rows[0];
+      if (!r) return null;
+      return {
+        clusterId: r.cluster_id as string,
+        repoFullName: r.repo as string,
+        targetVersion: null,
+        productLabel: r.product_label as string,
+        thresholdUsed: Number(r.threshold_used ?? 0),
+        topkUsed: Number(r.topk_used ?? 0),
+        size: Number(r.size ?? 0),
+        popularity: Number(r.popularity ?? 0),
+        representativeIssueNumber: (r.representative_issue_number as number | null) ?? null,
+        updatedAt: r.updated_at as string,
+      };
+    },
+
+    async listIssuesInCluster(input: {
+      repoFullName: string;
+      clusterId: string;
+    }): Promise<
+      Array<{
+        issueNumber: number;
+        title: string;
+        state: 'open' | 'closed';
+        labelsJson: any;
+        updatedAt: string;
+        similarity: number;
+      }>
+    > {
+      const res = await db.pool.query(
+        `
+        select
+          i.issue_number,
+          i.title,
+          i.state,
+          i.labels_json,
+          i.updated_at,
+          m.similarity
+        from issue_cluster_map m
+        join issues i on i.repo = m.repo and i.issue_number = m.issue_number
+        where m.repo = $1 and m.cluster_id = $2
+        order by m.similarity desc, i.updated_at desc, i.issue_number asc
+        `,
+        [input.repoFullName, input.clusterId]
+      );
+      return res.rows.map((r: any) => ({
+        issueNumber: Number(r.issue_number),
+        title: r.title as string,
+        state: r.state as 'open' | 'closed',
+        labelsJson: r.labels_json,
+        updatedAt: r.updated_at as string,
+        similarity: Number(r.similarity ?? 0),
+      }));
+    },
+
+    async searchIssues(input: {
+      repoFullName: string;
+      targetVersion: string | null;
+      productLabels?: string[];
+      state?: 'open' | 'closed';
+      clusterId?: string;
+      q?: string;
+      limit?: number;
+      offset?: number;
+    }): Promise<
+      Array<{
+        issueNumber: number;
+        title: string;
+        state: 'open' | 'closed';
+        targetVersion: string | null;
+        labelsJson: any;
+        productLabels: string[];
+        updatedAt: string;
+      }>
+    > {
+      const conditions: string[] = ['i.repo = $1'];
+      const params: any[] = [input.repoFullName];
+
+      if (input.targetVersion !== undefined) {
+        params.push(input.targetVersion);
+        conditions.push(`i.target_version is not distinct from $${params.length}`);
+      }
+
+      if (input.state) {
+        params.push(input.state);
+        conditions.push(`i.state = $${params.length}`);
+      }
+
+      if (input.clusterId) {
+        params.push(input.clusterId);
+        conditions.push(`m.cluster_id = $${params.length}`);
+      }
+
+      if (input.productLabels && input.productLabels.length > 0) {
+        params.push(input.productLabels);
+        conditions.push(`p.product_label = any($${params.length}::text[])`);
+      }
+
+      if (input.q && input.q.trim()) {
+        params.push(`%${input.q.trim()}%`);
+        conditions.push(`(i.title ilike $${params.length} or i.body ilike $${params.length})`);
+      }
+
+      const limit = Math.min(input.limit ?? 50, 200);
+      const offset = input.offset ?? 0;
+      params.push(limit);
+      params.push(offset);
+
+      const sql = `
+        select
+          i.issue_number,
+          i.title,
+          i.state,
+          i.target_version,
+          i.labels_json,
+          i.updated_at,
+          array_agg(distinct p.product_label) as product_labels
+        from issues i
+        left join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
+        left join issue_cluster_map m on m.repo = i.repo and m.issue_number = i.issue_number
+        where ${conditions.join(' and ')}
+        group by i.issue_number, i.title, i.state, i.target_version, i.labels_json, i.updated_at
+        order by i.updated_at desc, i.issue_number asc
+        limit $${params.length - 1} offset $${params.length}
+      `;
+
+      const res = await db.pool.query(sql, params);
+      return res.rows.map((r: any) => ({
+        issueNumber: Number(r.issue_number),
+        title: r.title as string,
+        state: r.state as 'open' | 'closed',
+        targetVersion: (r.target_version as string | null) ?? null,
+        labelsJson: r.labels_json,
+        productLabels: (r.product_labels as string[] | null) ?? [],
+        updatedAt: r.updated_at as string,
+      }));
+    },
+
+    async getIssueSyncStatus(repoFullName: string): Promise<{
+      currentCount: number;
+      estimatedTotal: number | null;
+      isSyncing: boolean;
+      lastSyncedAt: string | null;
+      progress: number;
+    }> {
+      const countRes = await db.pool.query(
+        'SELECT COUNT(*) as cnt FROM issues WHERE repo = $1',
+        [repoFullName]
+      );
+      const currentCount = Number(countRes.rows[0]?.cnt ?? 0);
+      
+      const stateRes = await db.pool.query(
+        'SELECT estimated_total_issues, is_syncing, last_synced_at FROM issue_sync_state WHERE repo = $1',
+        [repoFullName]
+      );
+      const row = stateRes.rows[0];
+      const estimatedTotal = row?.estimated_total_issues ? Number(row.estimated_total_issues) : null;
+      const isSyncing = Boolean(row?.is_syncing);
+      const lastSyncedAt = row?.last_synced_at as string | null ?? null;
+      
+      // Calculate progress
+      let progress = 0;
+      if (estimatedTotal && estimatedTotal > 0) {
+        progress = Math.min(100, Math.floor((currentCount / estimatedTotal) * 100));
+      } else if (currentCount > 0) {
+        progress = isSyncing ? 50 : 100; // Unknown total, show 50% if syncing
+      }
+      
+      return {
+        currentCount,
+        estimatedTotal,
+        isSyncing,
+        lastSyncedAt,
+        progress,
+      };
+    },
+
+    async getIssueStats(repoFullName: string): Promise<{
+      totalIssues: number;
+      openIssues: number;
+      embeddedOpenIssues: number;
+    }> {
+      const res = await db.pool.query(
+        `
+        select
+          count(*)::int as total_issues,
+          count(*) filter (where state = 'open')::int as open_issues,
+          count(*) filter (where state = 'open' and embedding is not null)::int as embedded_open_issues
+        from issues
+        where repo = $1
+        `,
+        [repoFullName]
+      );
+      const row = res.rows[0] ?? {};
+      return {
+        totalIssues: Number(row.total_issues ?? 0),
+        openIssues: Number(row.open_issues ?? 0),
+        embeddedOpenIssues: Number(row.embedded_open_issues ?? 0),
+      };
+    },
   };
 }
 

@@ -1,9 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { ServiceBusClient, type ServiceBusSender } from '@azure/service-bus';
-import type { RegenerateReleaseNoteRequest } from '@release-agent/contracts';
+import type { IssueReclusterRequest, IssueSyncRequest, RegenerateReleaseNoteRequest } from '@release-agent/contracts';
 
 export type SessionRunEnqueuer = (sessionId: string) => Promise<void>;
 export type CommitRegenEnqueuer = (request: RegenerateReleaseNoteRequest) => Promise<void>;
+export type IssueSyncEnqueuer = (request: IssueSyncRequest) => Promise<void>;
+export type IssueReclusterEnqueuer = (request: IssueReclusterRequest) => Promise<void>;
 
 function createEnqueuer<T>(
   server: FastifyInstance,
@@ -46,4 +48,14 @@ export function createSessionRunEnqueuer(server: FastifyInstance): SessionRunEnq
 export function createCommitRegenEnqueuer(server: FastifyInstance): CommitRegenEnqueuer | null {
   const queueName = process.env.SERVICEBUS_COMMIT_REGEN_QUEUE ?? 'commit-regen';
   return createEnqueuer<RegenerateReleaseNoteRequest>(server, queueName, 'commit-regen');
+}
+
+export function createIssueSyncEnqueuer(server: FastifyInstance): IssueSyncEnqueuer | null {
+  const queueName = process.env.SERVICEBUS_ISSUE_SYNC_QUEUE ?? 'issue-sync';
+  return createEnqueuer<IssueSyncRequest>(server, queueName, 'issue-sync');
+}
+
+export function createIssueReclusterEnqueuer(server: FastifyInstance): IssueReclusterEnqueuer | null {
+  const queueName = process.env.SERVICEBUS_ISSUE_RECLUSTER_QUEUE ?? 'issue-recluster';
+  return createEnqueuer<IssueReclusterRequest>(server, queueName, 'issue-recluster');
 }

@@ -3,6 +3,7 @@ import cors from '@fastify/cors';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerDocsRoutes } from './routes/docs.js';
 import { registerSessionRoutes } from './routes/sessions.js';
+import { registerIssueRoutes } from './routes/issues.js';
 import { createDb } from './db.js';
 import { createPgStore } from './store/pg.js';
 
@@ -43,6 +44,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   registerHealthRoutes(server);
   await registerDocsRoutes(server);
   registerSessionRoutes(server, store);
+  registerIssueRoutes(server, store);
 
   return server;
 }

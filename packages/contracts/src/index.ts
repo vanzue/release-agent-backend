@@ -102,3 +102,17 @@ export type RegenerateReleaseNoteRequest = {
   commitSha: string;
   repoFullName: string;
 };
+
+// Issue clustering jobs
+export type IssueSyncRequest = {
+  repoFullName: string;
+  fullSync?: boolean;
+};
+
+export type IssueReclusterRequest = {
+  repoFullName: string;
+  targetVersion: string | null;
+  productLabel: string;
+  threshold: number;
+  topK: number;
+};

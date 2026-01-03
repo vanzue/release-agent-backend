@@ -65,6 +65,10 @@ jobs:
             -WorkerGitHubToken "${{ secrets.WORKER_GITHUB_TOKEN }}" `
             -ServiceBusQueueName "${{ env.SERVICEBUS_QUEUE_NAME }}" `
             -CommitRegenQueueName "${{ env.COMMIT_REGEN_QUEUE_NAME }}" `
+            -IssueSyncQueueName "issue-sync" `
+            -IssueReclusterQueueName "issue-recluster" `
+            -IssueAutoSyncIntervalMinutes 30 `
+            -IssueEmbeddingModelId "${{ vars.ISSUE_EMBEDDING_MODEL_ID }}" `
             -CorsOrigin "${{ vars.CORS_ORIGIN }}" `
             -LlmProvider "${{ vars.LLM_PROVIDER }}" `
             -LlmModel "${{ vars.LLM_MODEL }}" `
