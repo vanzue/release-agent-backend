@@ -7,7 +7,7 @@ import type { RegenerateReleaseNoteRequest } from '@release-agent/contracts';
 import type { IssueReclusterRequest, IssueSyncRequest } from './issues/types.js';
 import { syncIssues } from './issues/sync.js';
 import { reclusterBucket } from './issues/recluster.js';
-import { getIssueSyncState, setIssueSyncingStatus } from './issues/issueStore.js';
+import { getIssueSyncState } from './issues/issueStore.js';
 
 const logger = pino({
   level: process.env.LOG_LEVEL ?? 'info',
@@ -37,52 +37,34 @@ const issueSyncReceiver = client.createReceiver(issueSyncQueueName);
 const issueReclusterReceiver = client.createReceiver(issueReclusterQueueName);
 const db = createDb();
 
-// Automatic sync on worker startup (and optionally on a timer).
+// Continuous issue sync - runs forever, polling for new issues
 const autoSyncRepos = (process.env.ISSUE_AUTO_SYNC_REPOS ?? 'microsoft/PowerToys')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
-const autoSyncIntervalMinutes = Number.parseInt(process.env.ISSUE_AUTO_SYNC_INTERVAL_MINUTES ?? '0', 10);
+const syncSleepMinutes = Number.parseInt(process.env.ISSUE_SYNC_SLEEP_MINUTES ?? '5', 10);
 
-const running = new Set<string>();
-
-const runAutoSync = async (repoFullName: string) => {
-  if (running.has(repoFullName)) return;
+const runContinuousSync = async (repoFullName: string) => {
+  logger.info({ repoFullName, syncSleepMinutes }, 'Starting continuous issue sync');
   
-  // Check if already syncing (from previous worker run or another instance)
-  const syncState = await getIssueSyncState(db, repoFullName);
-  if (syncState.isSyncing) {
-    logger.info({ repoFullName }, 'Skipping auto sync - already syncing');
-    return;
-  }
-  
-  running.add(repoFullName);
-  try {
-    logger.info({ repoFullName }, 'Auto issue sync starting');
-    await setIssueSyncingStatus(db, repoFullName, true);
-    await syncIssues(db, { repoFullName, fullSync: false });
-    logger.info({ repoFullName }, 'Auto issue sync done');
-  } catch (e) {
-    logger.error({ err: e, repoFullName }, 'Auto issue sync failed');
-  } finally {
-    await setIssueSyncingStatus(db, repoFullName, false);
-    running.delete(repoFullName);
+  while (true) {
+    try {
+      const result = await syncIssues(db, { repoFullName, fullSync: false });
+      logger.info({ repoFullName, fetched: result.fetched, embedded: result.embedded }, 'Sync cycle complete');
+      
+      // Sleep before next poll
+      logger.debug({ repoFullName, sleepMinutes: syncSleepMinutes }, 'Sleeping before next sync');
+      await new Promise(resolve => setTimeout(resolve, syncSleepMinutes * 60_000));
+    } catch (e) {
+      logger.error({ err: e, repoFullName }, 'Sync cycle failed, will retry after sleep');
+      await new Promise(resolve => setTimeout(resolve, syncSleepMinutes * 60_000));
+    }
   }
 };
 
-// Always run once at startup.
+// Start continuous sync for each repo
 for (const repoFullName of autoSyncRepos) {
-  void runAutoSync(repoFullName);
-}
-
-// Optional periodic sync.
-if (autoSyncIntervalMinutes > 0) {
-  const intervalMs = autoSyncIntervalMinutes * 60_000;
-  setInterval(() => {
-    for (const repoFullName of autoSyncRepos) {
-      void runAutoSync(repoFullName);
-    }
-  }, intervalMs);
+  void runContinuousSync(repoFullName);
 }
 
 // Subscribe to session-run queue

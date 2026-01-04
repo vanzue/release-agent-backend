@@ -22,9 +22,13 @@ function issuePopularity(input: { comments: number; reactions: number; updatedAt
   return 2 * commentsScore + 1 * reactionsScore + recency;
 }
 
+// Use '__all__' as a placeholder for NULL targetVersion since the DB schema requires NOT NULL
+const ALL_VERSIONS_PLACEHOLDER = '__all__';
+
 export async function reclusterBucket(db: Db, req: IssueReclusterRequest): Promise<{ clusters: number; mapped: number }> {
   const repoFullName = req.repoFullName;
-  const targetVersion = null;
+  // If targetVersion is null (All Versions), use placeholder for DB storage
+  const targetVersion = req.targetVersion ?? ALL_VERSIONS_PLACEHOLDER;
   const productLabel = req.productLabel;
   const threshold = req.threshold;
   const topK = req.topK;
@@ -73,11 +77,11 @@ export async function reclusterBucket(db: Db, req: IssueReclusterRequest): Promi
 
     const nearest = await db.pool.query(
       `
-      select cluster_id, centroid, size, (centroid <=> $4::vector) as cosine_distance
+      select cluster_id, centroid, size, (centroid <=> $3::vector) as cosine_distance
       from clusters
       where repo = $1 and product_label = $2
-      order by centroid <=> $4::vector asc
-      limit $5
+      order by centroid <=> $3::vector asc
+      limit $4
       `,
       [repoFullName, productLabel, embeddingLit, topK]
     );
@@ -145,15 +149,14 @@ export async function reclusterBucket(db: Db, req: IssueReclusterRequest): Promi
   await db.pool.query(
     `
     update clusters c
-    set representative_issue_number = r.issue_number
-    from lateral (
+    set representative_issue_number = (
       select m.issue_number
       from issue_cluster_map m
       join issues i on i.repo = m.repo and i.issue_number = m.issue_number
       where m.cluster_id = c.cluster_id and i.embedding is not null
       order by (c.centroid <=> i.embedding) asc
       limit 1
-    ) r
+    )
     where c.repo = $1 and c.product_label = $2
     `,
     [repoFullName, productLabel]

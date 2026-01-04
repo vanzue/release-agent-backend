@@ -25,19 +25,15 @@ function contentHash(input: {
 export async function getIssueSyncState(db: Db, repoFullName: string): Promise<{
   lastSyncedAt: string | null;
   lastSyncedIssueNumber: number | null;
-  estimatedTotalIssues: number | null;
-  isSyncing: boolean;
 }> {
   const res = await db.pool.query(
-    'select last_synced_at, last_synced_issue_number, estimated_total_issues, is_syncing from issue_sync_state where repo = $1',
+    'select last_synced_at, last_synced_issue_number from issue_sync_state where repo = $1',
     [repoFullName]
   );
   const row = res.rows[0];
   return {
     lastSyncedAt: (row?.last_synced_at as string | null | undefined) ?? null,
     lastSyncedIssueNumber: (row?.last_synced_issue_number as number | null | undefined) ?? null,
-    estimatedTotalIssues: (row?.estimated_total_issues as number | null | undefined) ?? null,
-    isSyncing: Boolean(row?.is_syncing),
   };
 }
 
@@ -47,34 +43,34 @@ export async function setIssueSyncState(
   input: { 
     lastSyncedAt: string | null; 
     lastSyncedIssueNumber: number | null;
-    estimatedTotalIssues?: number | null;
   }
 ): Promise<void> {
   await db.pool.query(
     `
-    insert into issue_sync_state (repo, last_synced_at, last_synced_issue_number, estimated_total_issues, updated_at)
-    values ($1, $2::timestamptz, $3, $4, now())
+    insert into issue_sync_state (repo, last_synced_at, last_synced_issue_number, updated_at)
+    values ($1, $2::timestamptz, $3, now())
     on conflict (repo) do update set
       last_synced_at = excluded.last_synced_at,
       last_synced_issue_number = excluded.last_synced_issue_number,
-      estimated_total_issues = coalesce(excluded.estimated_total_issues, issue_sync_state.estimated_total_issues),
       updated_at = now()
     `,
-    [repoFullName, input.lastSyncedAt, input.lastSyncedIssueNumber, input.estimatedTotalIssues ?? null]
+    [repoFullName, input.lastSyncedAt, input.lastSyncedIssueNumber]
   );
 }
 
-export async function setIssueSyncingStatus(db: Db, repoFullName: string, isSyncing: boolean): Promise<void> {
-  await db.pool.query(
-    `
-    insert into issue_sync_state (repo, is_syncing, updated_at)
-    values ($1, $2, now())
-    on conflict (repo) do update set
-      is_syncing = excluded.is_syncing,
-      updated_at = now()
-    `,
-    [repoFullName, isSyncing]
-  );
+export function extractIssueType(labels: Array<{ name?: string }> | null | undefined): string | null {
+  for (const l of labels ?? []) {
+    const name = l?.name?.toLowerCase();
+    if (name === 'issue-bug') return 'bug';
+    if (name === 'issue-feature') return 'feature';
+    if (name === 'issue-docs') return 'docs';
+    if (name === 'issue-translation') return 'translation';
+    if (name === 'issue-task') return 'task';
+    if (name === 'issue-refactoring') return 'refactoring';
+    if (name === 'issue-dcr') return 'dcr';
+    if (name === 'issue-question') return 'question';
+  }
+  return null;
 }
 
 export async function upsertIssue(
@@ -99,6 +95,7 @@ export async function upsertIssue(
 
   const bodySnip = body ? body.slice(0, 500) : null;
   const reactionsTotal = input.issue.reactions?.total_count ?? 0;
+  const issueType = extractIssueType(input.issue.labels);
 
   const res = await db.pool.query(
     `
@@ -108,7 +105,7 @@ export async function upsertIssue(
       labels_json, milestone_title, target_version,
       state, created_at, updated_at, closed_at,
       comments_count, reactions_total_count,
-      content_hash, fetched_at
+      content_hash, fetched_at, issue_type
     )
     values (
       $1, $2, $3,
@@ -116,7 +113,7 @@ export async function upsertIssue(
       $7::jsonb, $8, $9,
       $10, $11::timestamptz, $12::timestamptz, $13::timestamptz,
       $14, $15,
-      $16, now()
+      $16, now(), $17
     )
     on conflict (repo, issue_number) do update set
       gh_id = excluded.gh_id,
@@ -135,7 +132,8 @@ export async function upsertIssue(
       content_hash = excluded.content_hash,
       embedding = case when issues.content_hash <> excluded.content_hash then null else issues.embedding end,
       embedding_model = case when issues.content_hash <> excluded.content_hash then null else issues.embedding_model end,
-      fetched_at = now()
+      fetched_at = now(),
+      issue_type = excluded.issue_type
     returning embedding is null as needs_embedding
     `,
     [
@@ -155,6 +153,7 @@ export async function upsertIssue(
       input.issue.comments ?? 0,
       reactionsTotal,
       hash,
+      issueType,
     ]
   );
   return { needsEmbedding: Boolean(res.rows[0]?.needs_embedding) };

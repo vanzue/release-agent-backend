@@ -30,7 +30,7 @@ export function extractPowertoysReportedVersion(body: string | null): string | n
   if (!body) return null;
   const v = extractTemplateField(body, 'Microsoft PowerToys version');
   if (!v) return null;
-  const m = v.match(/(\d+\.\d+)/);
+  const m = v.match(/(\d+\.\d+(?:\.\d+)?)/);
   return m?.[1] ?? null;
 }
 
@@ -55,8 +55,18 @@ export function extractPowertoysAreaProductLabels(body: string | null): string[]
 
   // PowerToys templates often use human-readable names like "Light Switch".
   // Convert to a stable label-ish form like "Product-LightSwitch".
-  const parts = area
-    .split(/[\n,;/]+/g)
+  // Only consider the first few lines (before empty line or long text) as areas
+  const lines = area.split(/\r?\n/);
+  const areaLines: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    // Stop at empty line or very long line (likely issue description, not area)
+    if (!trimmed || trimmed.length > 80) break;
+    areaLines.push(trimmed);
+  }
+
+  const parts = areaLines
+    .flatMap((line) => line.split(/[,;/]+/g))
     .map((p) => p.trim())
     .filter(Boolean);
 

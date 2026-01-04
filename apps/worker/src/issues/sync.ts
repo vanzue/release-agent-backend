@@ -11,7 +11,7 @@ const logger = pino({ name: 'issue-sync', level: process.env.LOG_LEVEL ?? 'info'
 
 function extractVersionFromMilestoneTitle(title: string | null): string | null {
   if (!title) return null;
-  const m = title.match(/(\d+\.\d+)/);
+  const m = title.match(/(\d+\.\d+(?:\.\d+)?)/);
   return m?.[1] ?? null;
 }
 
@@ -45,7 +45,6 @@ function buildEmbeddingText(title: string, body: string | null): string {
 export async function syncIssues(
   db: Db,
   request: IssueSyncRequest,
-  options?: { onProgress?: (processed: number, total: number) => Promise<void> | void }
 ): Promise<{ fetched: number; embedded: number; lastSyncedAt: string | null; lastSyncedIssueNumber: number | null }> {
   const repoFullName = request.repoFullName;
   const fullSync = Boolean(request.fullSync);
@@ -121,7 +120,6 @@ export async function syncIssues(
     // Full sync: stream issues and process each batch immediately
     // Use lastIssueNumber to resume from where we left off if interrupted
     logger.info({ repoFullName, resumeFromIssue: lastIssueNumber }, 'Starting full sync (streaming)');
-    let estimatedTotal: number | null = null;
     
     for await (const batch of streamIssuesByCreated({ 
       repoFullName, 
@@ -129,30 +127,17 @@ export async function syncIssues(
       direction: 'asc',
       sinceIssueNumber: lastIssueNumber, // Skip already-processed issues
     })) {
-      // Update estimated total from first batch and save to DB
-      if (estimatedTotal === null && batch.estimatedTotalIssues) {
-        estimatedTotal = batch.estimatedTotalIssues;
-      }
-      
-      logger.info({ repoFullName, batchSize: batch.issues.length, processedSoFar: processed, page: batch.page, estimatedTotal }, 'Processing batch');
+      logger.info({ repoFullName, batchSize: batch.issues.length, processedSoFar: processed, page: batch.page }, 'Processing batch');
       for (const issue of batch.issues) {
         await processIssue(issue);
       }
       
       // Save checkpoint after each batch so we can resume from here if interrupted
-      // Also save estimatedTotal on first batch
       await setIssueSyncState(db, repoFullName, { 
         lastSyncedAt: maxUpdatedAt, 
         lastSyncedIssueNumber: maxIssueNumber,
-        estimatedTotalIssues: estimatedTotal,
       });
       logger.debug({ repoFullName, maxIssueNumber, processed }, 'Checkpoint saved');
-      
-      // Report progress after each batch with estimated total
-      if (options?.onProgress) {
-        const total = estimatedTotal ?? processed;
-        await options.onProgress(processed, total);
-      }
     }
   } else {
     // Incremental sync: collect then process (may have duplicates between updated and new)
@@ -171,9 +156,6 @@ export async function syncIssues(
 
     for (const issue of issues) {
       await processIssue(issue);
-      if (options?.onProgress && (processed % 100 === 0 || processed === issues.length)) {
-        await options.onProgress(processed, issues.length);
-      }
     }
   }
 

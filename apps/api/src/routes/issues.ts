@@ -3,21 +3,27 @@ import type { PgStore } from '../store/pg.js';
 import type { IssueReclusterRequest, IssueSyncRequest } from '@release-agent/contracts';
 import { createIssueReclusterEnqueuer, createIssueSyncEnqueuer } from '../queue.js';
 
-function parseVersionKey(v: string): [number, number] | null {
-  const m = v.match(/^(\d+)\.(\d+)$/);
+function parseVersionKey(v: string): [number, number, number] | null {
+  const m = v.match(/^(\d+)\.(\d+)(?:\.(\d+))?$/);
   if (!m) return null;
-  return [Number.parseInt(m[1], 10), Number.parseInt(m[2], 10)];
+  return [Number.parseInt(m[1], 10), Number.parseInt(m[2], 10), Number.parseInt(m[3] ?? '0', 10)];
+}
+
+function compareVersionKeys(a: [number, number, number], b: [number, number, number]): number {
+  if (a[0] !== b[0]) return a[0] - b[0];
+  if (a[1] !== b[1]) return a[1] - b[1];
+  return a[2] - b[2];
 }
 
 function pickLatestVersion(versions: Array<string | null>): string | null {
   const candidates = versions.filter((v): v is string => typeof v === 'string');
   let best: string | null = null;
-  let bestKey: [number, number] | null = null;
+  let bestKey: [number, number, number] | null = null;
 
   for (const v of candidates) {
     const key = parseVersionKey(v);
     if (!key) continue;
-    if (!bestKey || key[0] > bestKey[0] || (key[0] === bestKey[0] && key[1] > bestKey[1])) {
+    if (!bestKey || compareVersionKeys(key, bestKey) > 0) {
       bestKey = key;
       best = v;
     }
@@ -41,11 +47,22 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
     const { repo, targetVersion } = req.query as { repo: string; targetVersion?: string };
     const versions = await store.listIssueVersions(repo);
     const defaultTargetVersion = pickLatestVersion(versions.map((v) => v.targetVersion));
-    const resolvedTargetVersion = targetVersion ?? defaultTargetVersion;
+    
+    // If targetVersion is '__null__', user explicitly wants unversioned issues
+    // If targetVersion is undefined, return all versions (no filter)
+    // Otherwise, use the provided version
+    let resolvedTargetVersion: string | null | undefined;
+    if (targetVersion === undefined) {
+      resolvedTargetVersion = undefined; // all versions
+    } else if (targetVersion === '__null__') {
+      resolvedTargetVersion = null; // unversioned
+    } else {
+      resolvedTargetVersion = targetVersion;
+    }
 
     const products = await store.listIssueProducts({
       repoFullName: repo,
-      targetVersion: resolvedTargetVersion ?? null,
+      targetVersion: resolvedTargetVersion,
     });
 
     return { targetVersion: resolvedTargetVersion ?? null, defaultTargetVersion, products };
@@ -152,5 +169,36 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
     const { repo } = req.query as { repo: string };
     const stats = await store.getIssueStats(repo);
     return stats;
+  });
+
+  server.get('/issues/top-by-reactions', async (req) => {
+    const { repo, targetVersion, productLabel, limit } = req.query as {
+      repo: string;
+      targetVersion?: string;
+      productLabel?: string;
+      limit?: string;
+    };
+    const versions = await store.listIssueVersions(repo);
+    const defaultTargetVersion = pickLatestVersion(versions.map((v) => v.targetVersion));
+    
+    // If targetVersion is '__null__', user explicitly wants unversioned issues
+    // If targetVersion is undefined, return all versions (no filter)
+    let resolvedTargetVersion: string | null | undefined;
+    if (targetVersion === undefined) {
+      resolvedTargetVersion = undefined; // all versions
+    } else if (targetVersion === '__null__') {
+      resolvedTargetVersion = null; // unversioned
+    } else {
+      resolvedTargetVersion = targetVersion;
+    }
+
+    const issues = await store.getTopIssuesByReactions({
+      repoFullName: repo,
+      targetVersion: resolvedTargetVersion,
+      productLabel,
+      limit: limit ? Number.parseInt(limit, 10) : undefined,
+    });
+
+    return { targetVersion: resolvedTargetVersion ?? null, issues };
   });
 }

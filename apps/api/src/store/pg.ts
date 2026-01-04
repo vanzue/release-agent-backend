@@ -196,6 +196,12 @@ export function createPgStore(db: Db) {
         from issues
         where repo = $1 and state = 'open'
         group by target_version
+        order by
+          -- Sort by numeric version parts: major.minor.patch
+          (regexp_match(target_version, '^(\\d+)'))[1]::int desc nulls last,
+          (regexp_match(target_version, '^\\d+\\.(\\d+)'))[1]::int desc nulls last,
+          (regexp_match(target_version, '^\\d+\\.\\d+\\.(\\d+)'))[1]::int desc nulls last,
+          target_version desc nulls last
         `,
         [repoFullName]
       );
@@ -207,8 +213,9 @@ export function createPgStore(db: Db) {
 
     async listIssueProducts(input: {
       repoFullName: string;
-      targetVersion: string | null;
+      targetVersion: string | null | undefined; // undefined = all versions
     }): Promise<Array<{ productLabel: string; issueCount: number; clusterCount: number }>> {
+      const filterByVersion = input.targetVersion !== undefined;
       const res = await db.pool.query(
         `
         with product_issue_counts as (
@@ -217,7 +224,7 @@ export function createPgStore(db: Db) {
           join issues i on i.repo = p.repo and i.issue_number = p.issue_number
           where i.repo = $1
             and i.state = 'open'
-            and i.target_version is not distinct from $2
+            and ($2::boolean = false or i.target_version is not distinct from $3)
           group by p.product_label
         )
         select
@@ -229,7 +236,7 @@ export function createPgStore(db: Db) {
         from product_issue_counts pic
         order by pic.issue_count desc, pic.product_label asc
         `,
-        [input.repoFullName, input.targetVersion]
+        [input.repoFullName, filterByVersion, input.targetVersion ?? null]
       );
 
       return res.rows.map((r: any) => ({
@@ -442,10 +449,7 @@ export function createPgStore(db: Db) {
 
     async getIssueSyncStatus(repoFullName: string): Promise<{
       currentCount: number;
-      estimatedTotal: number | null;
-      isSyncing: boolean;
       lastSyncedAt: string | null;
-      progress: number;
     }> {
       const countRes = await db.pool.query(
         'SELECT COUNT(*) as cnt FROM issues WHERE repo = $1',
@@ -454,28 +458,15 @@ export function createPgStore(db: Db) {
       const currentCount = Number(countRes.rows[0]?.cnt ?? 0);
       
       const stateRes = await db.pool.query(
-        'SELECT estimated_total_issues, is_syncing, last_synced_at FROM issue_sync_state WHERE repo = $1',
+        'SELECT last_synced_at FROM issue_sync_state WHERE repo = $1',
         [repoFullName]
       );
       const row = stateRes.rows[0];
-      const estimatedTotal = row?.estimated_total_issues ? Number(row.estimated_total_issues) : null;
-      const isSyncing = Boolean(row?.is_syncing);
       const lastSyncedAt = row?.last_synced_at as string | null ?? null;
-      
-      // Calculate progress
-      let progress = 0;
-      if (estimatedTotal && estimatedTotal > 0) {
-        progress = Math.min(100, Math.floor((currentCount / estimatedTotal) * 100));
-      } else if (currentCount > 0) {
-        progress = isSyncing ? 50 : 100; // Unknown total, show 50% if syncing
-      }
       
       return {
         currentCount,
-        estimatedTotal,
-        isSyncing,
         lastSyncedAt,
-        progress,
       };
     },
 
@@ -501,6 +492,65 @@ export function createPgStore(db: Db) {
         openIssues: Number(row.open_issues ?? 0),
         embeddedOpenIssues: Number(row.embedded_open_issues ?? 0),
       };
+    },
+
+    async getTopIssuesByReactions(input: {
+      repoFullName: string;
+      targetVersion: string | null | undefined; // undefined = all versions
+      productLabel?: string;
+      limit?: number;
+    }): Promise<
+      Array<{
+        issueNumber: number;
+        title: string;
+        state: 'open' | 'closed';
+        reactionsCount: number;
+        commentsCount: number;
+        updatedAt: string;
+      }>
+    > {
+      const limit = Math.min(input.limit ?? 20, 100);
+      const filterByVersion = input.targetVersion !== undefined;
+      const filterByProduct = !!input.productLabel;
+      
+      // Build query conditionally to avoid referencing p.product_label when not joining
+      const productJoin = filterByProduct 
+        ? 'join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number' 
+        : '';
+      const productFilter = filterByProduct 
+        ? 'and p.product_label = $5' 
+        : '';
+      
+      const res = await db.pool.query(
+        `
+        select
+          i.issue_number,
+          i.title,
+          i.state,
+          i.reactions_total_count,
+          i.comments_count,
+          i.updated_at
+        from issues i
+        ${productJoin}
+        where i.repo = $1
+          and i.state = 'open'
+          and ($2::boolean = false or i.target_version is not distinct from $3)
+          ${productFilter}
+        order by i.reactions_total_count desc, i.comments_count desc, i.updated_at desc
+        limit $4
+        `,
+        filterByProduct
+          ? [input.repoFullName, filterByVersion, input.targetVersion ?? null, limit, input.productLabel]
+          : [input.repoFullName, filterByVersion, input.targetVersion ?? null, limit]
+      );
+      return res.rows.map((r: any) => ({
+        issueNumber: Number(r.issue_number),
+        title: r.title as string,
+        state: r.state as 'open' | 'closed',
+        reactionsCount: Number(r.reactions_total_count ?? 0),
+        commentsCount: Number(r.comments_count ?? 0),
+        updatedAt: r.updated_at as string,
+      }));
     },
   };
 }
