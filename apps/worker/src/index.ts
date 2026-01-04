@@ -134,12 +134,9 @@ const issueSyncSubscription = issueSyncReceiver.subscribe({
     }
 
     try {
-      await setIssueSyncingStatus(db, body.repoFullName, true);
       await syncIssues(db, body);
     } catch (e) {
       logger.error({ err: e, body }, 'Issue sync failed');
-    } finally {
-      await setIssueSyncingStatus(db, body.repoFullName, false);
     }
   },
   async processError(args) {
