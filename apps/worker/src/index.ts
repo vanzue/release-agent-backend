@@ -89,7 +89,7 @@ const sessionRunSubscription = sessionRunReceiver.subscribe({
         await setJob(db, sessionId, 'generate-notes', 'failed', 100, e instanceof Error ? e.message : String(e));
         await setJob(db, sessionId, 'analyze-hotspots', 'failed', 100, e instanceof Error ? e.message : String(e));
         await setJob(db, sessionId, 'generate-testplan', 'failed', 100, e instanceof Error ? e.message : String(e));
-        await setSessionStatus(db, sessionId, 'generating');
+        await setSessionStatus(db, sessionId, 'failed');
       } catch (inner) {
         logger.error({ err: inner, sessionId }, 'Failed to record failure state');
       }

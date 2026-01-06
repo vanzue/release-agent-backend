@@ -1,5 +1,12 @@
 import pino from 'pino';
 import type { GithubIssue } from './types.js';
+import {
+  isHttpRateLimitError,
+  getRetryDelayFromHeaders,
+  sleep,
+  calculateBackoff,
+  type RetryConfig,
+} from '../retry.js';
 
 const logger = pino({ name: 'github-issues', level: process.env.LOG_LEVEL ?? 'info' });
 
@@ -21,52 +28,62 @@ type GitHubResponse<T> = {
   linkHeader: string | null;
 };
 
-async function githubRequestWithHeaders<T>(path: string, init?: RequestInit, retryCount = 0): Promise<GitHubResponse<T>> {
-  const token = requireGithubToken();
-  const res = await fetch(`https://api.github.com${path}`, {
-    ...init,
-    headers: {
-      accept: 'application/vnd.github+json',
-      authorization: `Bearer ${token}`,
-      'x-github-api-version': '2022-11-28',
-      ...(init?.headers ?? {}),
-    },
-  });
+// GitHub-specific retry configuration
+const GITHUB_RETRY_CONFIG: RetryConfig = {
+  maxAttempts: 6,
+  initialDelayMs: 5000,
+  maxDelayMs: 120000,
+  backoffMultiplier: 2,
+  jitter: true,
+};
 
-  // Handle rate limiting
-  if (res.status === 403 || res.status === 429) {
-    const rateLimitRemaining = res.headers.get('x-ratelimit-remaining');
-    const rateLimitReset = res.headers.get('x-ratelimit-reset');
-    
-    if (rateLimitRemaining === '0' || res.status === 429) {
-      const resetTime = rateLimitReset ? Number.parseInt(rateLimitReset, 10) * 1000 : Date.now() + 60_000;
-      const waitMs = Math.max(resetTime - Date.now(), 60_000); // At least 1 minute
-      const waitMinutes = Math.ceil(waitMs / 60_000);
-      
-      logger.warn({ path, waitMinutes, resetTime: new Date(resetTime).toISOString(), retryCount }, 'Rate limited, waiting before retry');
-      
-      if (retryCount >= 5) {
-        throw new Error(`GitHub API rate limit exceeded after ${retryCount} retries`);
+async function githubRequestWithHeaders<T>(path: string, init?: RequestInit): Promise<GitHubResponse<T>> {
+  const token = requireGithubToken();
+  const config = GITHUB_RETRY_CONFIG;
+
+  for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
+    const res = await fetch(`https://api.github.com${path}`, {
+      ...init,
+      headers: {
+        accept: 'application/vnd.github+json',
+        authorization: `Bearer ${token}`,
+        'x-github-api-version': '2022-11-28',
+        ...(init?.headers ?? {}),
+      },
+    });
+
+    if (res.ok) {
+      return {
+        data: (await res.json()) as T,
+        linkHeader: res.headers.get('link'),
+      };
+    }
+
+    const text = await res.text().catch(() => '');
+
+    if (isHttpRateLimitError(res.status, text)) {
+      if (attempt < config.maxAttempts) {
+        const retryAfterMs = getRetryDelayFromHeaders(res.headers, config.maxDelayMs);
+        const delayMs = calculateBackoff(attempt, config, retryAfterMs);
+
+        logger.warn(
+          { path, attempt, maxAttempts: config.maxAttempts, delayMs: Math.round(delayMs) },
+          'Rate limited, waiting before retry'
+        );
+        await sleep(delayMs);
+        continue;
       }
-      
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
-      return githubRequestWithHeaders<T>(path, init, retryCount + 1);
+      throw new Error(`GitHub API rate limit exceeded after ${config.maxAttempts} attempts: ${text}`);
+    } else {
+      throw new Error(`GitHub API error ${res.status} ${res.statusText}: ${text}`);
     }
   }
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`GitHub API error ${res.status} ${res.statusText}: ${text}`);
-  }
-
-  return {
-    data: (await res.json()) as T,
-    linkHeader: res.headers.get('link'),
-  };
+  throw new Error('GitHub API request failed after retries');
 }
 
-async function githubRequest<T>(path: string, init?: RequestInit, retryCount = 0): Promise<T> {
-  const result = await githubRequestWithHeaders<T>(path, init, retryCount);
+async function githubRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  const result = await githubRequestWithHeaders<T>(path, init);
   return result.data;
 }
 

@@ -1,3 +1,13 @@
+import { 
+  fetchWithRetry, 
+  isHttpRateLimitError, 
+  getRetryDelayFromHeaders,
+  sleep,
+  calculateBackoff,
+  DEFAULT_RETRY_CONFIG,
+  type RetryConfig
+} from './retry.js';
+
 type GithubUser = {
   login: string;
 };
@@ -44,24 +54,35 @@ function requireGithubToken() {
   return token;
 }
 
+// GitHub-specific retry configuration
+const GITHUB_RETRY_CONFIG: Partial<RetryConfig> = {
+  maxAttempts: 6,
+  initialDelayMs: 5000,
+  maxDelayMs: 120000,
+};
+
 async function githubRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const token = requireGithubToken();
-  const res = await fetch(`https://api.github.com${path}`, {
-    ...init,
-    headers: {
-      accept: 'application/vnd.github+json',
-      authorization: `Bearer ${token}`,
-      'x-github-api-version': '2022-11-28',
-      ...(init?.headers ?? {}),
+  
+  const response = await fetchWithRetry(
+    `https://api.github.com${path}`,
+    {
+      ...init,
+      headers: {
+        accept: 'application/vnd.github+json',
+        authorization: `Bearer ${token}`,
+        'x-github-api-version': '2022-11-28',
+        ...(init?.headers ?? {}),
+      },
     },
-  });
+    {
+      config: GITHUB_RETRY_CONFIG,
+      operation: `GitHub API ${path}`,
+      isRetryable: isHttpRateLimitError,
+    }
+  );
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`GitHub API error ${res.status} ${res.statusText}: ${text}`);
-  }
-
-  return (await res.json()) as T;
+  return (await response.json()) as T;
 }
 
 export function parseRepoFullName(repoFullName: string) {
@@ -133,18 +154,23 @@ export async function getCommitDiff(repoFullName: string, sha: string): Promise<
   const token = requireGithubToken();
   const { owner, repo } = parseRepoFullName(repoFullName);
   const encodedSha = encodeURIComponent(sha);
+  const path = `/repos/${owner}/${repo}/commits/${encodedSha}`;
   
-  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${encodedSha}`, {
-    headers: {
-      accept: 'application/vnd.github.diff',
-      authorization: `Bearer ${token}`,
-      'x-github-api-version': '2022-11-28',
+  const response = await fetchWithRetry(
+    `https://api.github.com${path}`,
+    {
+      headers: {
+        accept: 'application/vnd.github.diff',
+        authorization: `Bearer ${token}`,
+        'x-github-api-version': '2022-11-28',
+      },
     },
-  });
+    {
+      config: GITHUB_RETRY_CONFIG,
+      operation: `GitHub API ${path} (diff)`,
+      isRetryable: isHttpRateLimitError,
+    }
+  );
 
-  if (!res.ok) {
-    throw new Error(`GitHub API error ${res.status} ${res.statusText}`);
-  }
-
-  return await res.text();
+  return await response.text();
 }
