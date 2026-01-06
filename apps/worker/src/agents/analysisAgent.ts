@@ -148,21 +148,36 @@ export class AnalysisAgent {
     score: number;
     drivers: string[];
     contributingPrs: number[];
+    // Extra data for LLM enhancement
+    _meta?: {
+      prCount: number;
+      totalFiles: number;
+      totalChurn: number;
+      highRiskCount: number;
+      signals: string[];
+    };
   }> {
     // Group by area
     const byArea = new Map<string, {
       changes: ChangeInput[];
       totalScore: number;
       drivers: Set<string>;
+      totalFiles: number;
+      totalChurn: number;
+      highRiskCount: number;
     }>();
 
     for (const change of changes) {
       const score = this.calculateRiskScore(change);
       const existing = byArea.get(change.area);
+      const churn = change.additions + change.deletions;
 
       if (existing) {
         existing.changes.push(change);
         existing.totalScore += score;
+        existing.totalFiles += change.filesChanged;
+        existing.totalChurn += churn;
+        if (change.risk === 'High') existing.highRiskCount++;
         if (change.risk === 'High') existing.drivers.add('High-risk changes');
         if (change.filesChanged >= 10) existing.drivers.add('Large changes');
         for (const signal of change.signals) {
@@ -180,6 +195,9 @@ export class AnalysisAgent {
           changes: [change],
           totalScore: score,
           drivers,
+          totalFiles: change.filesChanged,
+          totalChurn: churn,
+          highRiskCount: change.risk === 'High' ? 1 : 0,
         });
       }
     }
@@ -189,12 +207,103 @@ export class AnalysisAgent {
       .map(([area, data]) => ({
         area,
         score: Math.min(Math.round(data.totalScore / data.changes.length + data.changes.length * 5), 100),
-        drivers: Array.from(data.drivers),
-        contributingPrs: data.changes.map(c => c.number),
+        drivers: Array.from(data.drivers).slice(0, 5),
+        contributingPrs: data.changes.map(c => c.number).slice(0, 10),
+        _meta: {
+          prCount: data.changes.length,
+          totalFiles: data.totalFiles,
+          totalChurn: data.totalChurn,
+          highRiskCount: data.highRiskCount,
+          signals: Array.from(data.drivers),
+        },
       }))
       .sort((a, b) => b.score - a.score);
 
     return hotspots;
+  }
+
+  /**
+   * Enhance a single hotspot with LLM-generated driver descriptions.
+   * Takes heuristic data and generates more meaningful explanations.
+   */
+  async enhanceHotspotDrivers(hotspot: {
+    area: string;
+    score: number;
+    _meta?: {
+      prCount: number;
+      totalFiles: number;
+      totalChurn: number;
+      highRiskCount: number;
+      signals: string[];
+    };
+  }): Promise<string[]> {
+    if (!hotspot._meta) {
+      return ['Changes detected in this area'];
+    }
+
+    const { prCount, totalFiles, totalChurn, highRiskCount, signals } = hotspot._meta;
+
+    const DriversSchema = z.object({
+      drivers: z.array(z.string()).max(4).describe('Concise reasons why this area needs testing attention'),
+    });
+
+    try {
+      const result = await this.llm.generateObject({
+        schema: DriversSchema,
+        messages: [
+          {
+            role: 'system',
+            content: 'Generate 2-4 concise testing priority reasons for a code area. Each reason should be 5-15 words. Focus on actionable testing guidance.',
+          },
+          {
+            role: 'user',
+            content: `Area: ${hotspot.area}
+Stats: ${prCount} PRs, ${totalFiles} files changed, ${totalChurn} lines modified
+High-risk changes: ${highRiskCount}
+Signals: ${signals.join(', ') || 'none'}
+Risk score: ${hotspot.score}/100
+
+Generate 2-4 concise reasons why QA should prioritize testing this area.`,
+          },
+        ],
+        maxTokens: 200,
+        temperature: 0.3,
+      });
+
+      return result.drivers;
+    } catch (error) {
+      logger.warn({ err: error, area: hotspot.area }, 'Failed to enhance hotspot drivers');
+      // Fallback to basic drivers
+      return this.generateBasicDrivers(hotspot._meta);
+    }
+  }
+
+  /**
+   * Generate basic driver descriptions from metadata (no LLM).
+   */
+  private generateBasicDrivers(meta: {
+    prCount: number;
+    totalFiles: number;
+    totalChurn: number;
+    highRiskCount: number;
+    signals: string[];
+  }): string[] {
+    const drivers: string[] = [];
+    
+    if (meta.prCount >= 5) drivers.push(`${meta.prCount} PRs concentrated in this area`);
+    else if (meta.prCount > 1) drivers.push(`${meta.prCount} PRs in this area`);
+    
+    if (meta.highRiskCount > 0) drivers.push(`${meta.highRiskCount} high-risk change(s)`);
+    if (meta.totalFiles >= 20) drivers.push(`${meta.totalFiles} files modified`);
+    if (meta.totalChurn >= 1000) drivers.push(`${meta.totalChurn} lines of code changed`);
+    
+    for (const signal of meta.signals.slice(0, 2)) {
+      if (!['High-risk changes', 'Large changes'].includes(signal)) {
+        drivers.push(`Touches ${signal.toLowerCase()} code`);
+      }
+    }
+    
+    return drivers.slice(0, 4);
   }
 }
 

@@ -95,10 +95,12 @@ function toHotspots(items: any[]): Hotspot[] {
   }));
 }
 
-async function failJob(ctx: SessionContext, job: string, error: string, skipNext?: string) {
+async function failJob(ctx: SessionContext, job: string, error: string, skipJobs?: string[]) {
   await setJob(ctx.db, ctx.sessionId, job, 'failed', 0, error);
-  if (skipNext) {
-    await setJob(ctx.db, ctx.sessionId, skipNext, 'skipped', 0, 'Previous step failed');
+  if (skipJobs?.length) {
+    for (const skipJob of skipJobs) {
+      await setJob(ctx.db, ctx.sessionId, skipJob, 'skipped', 0, `Skipped: ${job} failed`);
+    }
   }
   await setSessionStatus(ctx.db, ctx.sessionId, 'failed');
 }
@@ -107,91 +109,105 @@ async function failJob(ctx: SessionContext, job: string, error: string, skipNext
 // Job 1: Parse Changes
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function runParseChanges(ctx: SessionContext): Promise<ChangesArtifact> {
+async function runParseChanges(ctx: SessionContext): Promise<ChangesArtifact | null> {
   const { db, sessionId, repoFullName, baseRef, headRef } = ctx;
 
-  // Always fetch commits (needed for generate-notes even if changes are cached)
-  logger.info({ sessionId, repoFullName, baseRef, headRef }, 'Comparing commits');
-  const compare = await compareCommits(repoFullName, baseRef, headRef);
-  ctx.commits = compare.filter((c) => !isMergeCommit(c.commit.message));
-  logger.info({ sessionId, total: compare.length, filtered: ctx.commits.length }, 'Commits fetched');
+  try {
+    // Always fetch commits (needed for generate-notes even if changes are cached)
+    logger.info({ sessionId, repoFullName, baseRef, headRef }, 'Comparing commits');
+    const compare = await compareCommits(repoFullName, baseRef, headRef);
+    ctx.commits = compare.filter((c) => !isMergeCommit(c.commit.message));
+    logger.info({ sessionId, total: compare.length, filtered: ctx.commits.length }, 'Commits fetched');
 
-  // Check cache
-  const existing = await getArtifact(db, sessionId, 'changes');
-  if (existing?.items?.length > 0) {
-    logger.info({ sessionId, itemCount: existing.items.length }, 'Skipping parse-changes (cached)');
-    await setJob(db, sessionId, 'parse-changes', 'completed', 100);
-    // Still need to fetch PR details for generate-notes
+    // Check cache
+    const existing = await getArtifact(db, sessionId, 'changes');
+    if (existing?.items?.length > 0) {
+      logger.info({ sessionId, itemCount: existing.items.length }, 'Skipping parse-changes (cached)');
+      await setJob(db, sessionId, 'parse-changes', 'completed', 100);
+      // Still need to fetch PR details for generate-notes
+      ctx.commitToPr = await fetchCommitPrDetails(repoFullName, ctx.commits);
+      return existing;
+    }
+
+    await setJob(db, sessionId, 'parse-changes', 'running', 5);
+
+    // Find PRs for commits and fetch details
     ctx.commitToPr = await fetchCommitPrDetails(repoFullName, ctx.commits);
-    return existing;
+
+    // Fetch PR files for changes artifact
+    const prNumbers = [...new Set([...ctx.commitToPr.values()].map(p => p.number))];
+    const prsWithFiles = await Promise.all(
+      prNumbers.sort((a, b) => b - a).map(async (prNumber) => {
+        const pr = await getPullRequest(repoFullName, prNumber);
+        const files = await listPullRequestFiles(repoFullName, prNumber);
+        return { pr, files };
+      })
+    );
+
+    const artifact = buildChangesArtifact(sessionId, prsWithFiles);
+    await upsertArtifact(db, sessionId, 'changes', artifact);
+    await setSessionStats(db, sessionId, { changeCount: artifact.items.length });
+    await setJob(db, sessionId, 'parse-changes', 'completed', 100);
+
+    return artifact;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logger.error({ err: error, sessionId }, 'Parse changes failed');
+    await failJob(ctx, 'parse-changes', msg, ['generate-notes', 'analyze-hotspots', 'generate-testplan']);
+    return null;
   }
-
-  await setJob(db, sessionId, 'parse-changes', 'running', 5);
-
-  // Find PRs for commits and fetch details
-  ctx.commitToPr = await fetchCommitPrDetails(repoFullName, ctx.commits);
-
-  // Fetch PR files for changes artifact
-  const prNumbers = [...new Set([...ctx.commitToPr.values()].map(p => p.number))];
-  const prsWithFiles = await Promise.all(
-    prNumbers.sort((a, b) => b - a).map(async (prNumber) => {
-      const pr = await getPullRequest(repoFullName, prNumber);
-      const files = await listPullRequestFiles(repoFullName, prNumber);
-      return { pr, files };
-    })
-  );
-
-  const artifact = buildChangesArtifact(sessionId, prsWithFiles);
-  await upsertArtifact(db, sessionId, 'changes', artifact);
-  await setSessionStats(db, sessionId, { changeCount: artifact.items.length });
-  await setJob(db, sessionId, 'parse-changes', 'completed', 100);
-
-  return artifact;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Job 2: Generate Release Notes
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function runGenerateNotes(ctx: SessionContext, changesArtifact: ChangesArtifact): Promise<ReleaseNotesArtifact> {
+async function runGenerateNotes(ctx: SessionContext, changesArtifact: ChangesArtifact): Promise<ReleaseNotesArtifact | null> {
   const { db, sessionId, repoFullName, commits, commitToPr } = ctx;
 
-  const existing = await getArtifact(db, sessionId, 'release-notes');
-  if (existing?.sections?.some((s: any) => s.items?.length > 0)) {
-    logger.info({ sessionId }, 'Skipping generate-notes (cached)');
+  try {
+    const existing = await getArtifact(db, sessionId, 'release-notes');
+    if (existing?.sections?.some((s: any) => s.items?.length > 0)) {
+      logger.info({ sessionId }, 'Skipping generate-notes (cached)');
+      await setJob(db, sessionId, 'generate-notes', 'completed', 100);
+      return existing;
+    }
+
+    await setJob(db, sessionId, 'generate-notes', 'running', 5);
+
+    // Build PR -> area mapping from Changes
+    const prToArea = new Map<number, string>();
+    for (const item of changesArtifact.items ?? []) {
+      if (item.number && item.area) prToArea.set(item.number, item.area);
+    }
+
+    // Use commits from context (already fetched in runParseChanges)
+    const existingSummaries = await getCommitSummaries(db, repoFullName, commits.map((c) => c.sha));
+
+    // Split into cached vs. to-process (commitToPr already in context)
+    const { cached, toProcess } = splitCommits(commits, existingSummaries, commitToPr, prToArea);
+
+    // Fetch diffs for small changes
+    await enrichWithDiffs(repoFullName, toProcess);
+
+    // Generate summaries
+    const newResults = await generateSummaries(ctx, toProcess, commitToPr, prToArea);
+
+    // Build artifact
+    const allResults = [...cached, ...newResults];
+    const artifact = buildReleaseNotesArtifact(sessionId, allResults);
+
+    await upsertArtifact(db, sessionId, 'release-notes', artifact);
+    await setSessionStats(db, sessionId, { releaseNotesCount: allResults.length });
     await setJob(db, sessionId, 'generate-notes', 'completed', 100);
-    return existing;
+
+    return artifact;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logger.error({ err: error, sessionId }, 'Generate notes failed');
+    await failJob(ctx, 'generate-notes', msg);
+    return null;
   }
-
-  await setJob(db, sessionId, 'generate-notes', 'running', 5);
-
-  // Build PR -> area mapping from Changes
-  const prToArea = new Map<number, string>();
-  for (const item of changesArtifact.items ?? []) {
-    if (item.number && item.area) prToArea.set(item.number, item.area);
-  }
-
-  // Use commits from context (already fetched in runParseChanges)
-  const existingSummaries = await getCommitSummaries(db, repoFullName, commits.map((c) => c.sha));
-
-  // Split into cached vs. to-process (commitToPr already in context)
-  const { cached, toProcess } = splitCommits(commits, existingSummaries, commitToPr, prToArea);
-
-  // Fetch diffs for small changes
-  await enrichWithDiffs(repoFullName, toProcess);
-
-  // Generate summaries
-  const newResults = await generateSummaries(ctx, toProcess, commitToPr, prToArea);
-
-  // Build artifact
-  const allResults = [...cached, ...newResults];
-  const artifact = buildReleaseNotesArtifact(sessionId, allResults);
-
-  await upsertArtifact(db, sessionId, 'release-notes', artifact);
-  await setSessionStats(db, sessionId, { releaseNotesCount: allResults.length });
-  await setJob(db, sessionId, 'generate-notes', 'completed', 100);
-
-  return artifact;
 }
 
 async function fetchCommitPrDetails(repoFullName: string, commits: any[]): Promise<Map<string, PrDetails>> {
@@ -320,9 +336,9 @@ async function generateSummaries(
     return results;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    logger.error({ err: error, sessionId }, 'LLM generation failed');
-    await failJob(ctx, 'generate-notes', msg);
-    throw new Error(`LLM release notes generation failed: ${msg}`);
+    logger.error({ err: error, sessionId }, 'LLM generation failed, using fallback');
+    // Don't fail the job here, let caller handle it
+    return generateFallbackSummaries(ctx, toProcess, commitToPr, prToArea);
   }
 }
 
@@ -383,7 +399,7 @@ function buildReleaseNotesArtifact(sessionId: string, results: ReleaseNoteResult
 // Job 3: Analyze Hotspots
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function runAnalyzeHotspots(ctx: SessionContext, changesArtifact: ChangesArtifact): Promise<HotspotsArtifact> {
+async function runAnalyzeHotspots(ctx: SessionContext, changesArtifact: ChangesArtifact): Promise<HotspotsArtifact | null> {
   const { db, sessionId } = ctx;
 
   const existing = await getArtifact(db, sessionId, 'hotspots');
@@ -395,13 +411,6 @@ async function runAnalyzeHotspots(ctx: SessionContext, changesArtifact: ChangesA
 
   await setJob(db, sessionId, 'analyze-hotspots', 'running', 5);
 
-  const agent = getAnalysisAgent();
-  if (!agent) {
-    logger.error({ sessionId }, 'LLM not configured for analysis');
-    await failJob(ctx, 'analyze-hotspots', 'LLM not configured', 'generate-testplan');
-    throw new Error('LLM not configured for analysis');
-  }
-
   if (!changesArtifact.items?.length) {
     const artifact: HotspotsArtifact = { sessionId, items: [] };
     await upsertArtifact(db, sessionId, 'hotspots', artifact);
@@ -409,33 +418,112 @@ async function runAnalyzeHotspots(ctx: SessionContext, changesArtifact: ChangesA
     return artifact;
   }
 
-  try {
-    logger.info({ sessionId, changeCount: changesArtifact.items.length }, 'Analyzing hotspots');
-    const analysis = await agent.analyzeChanges(toChangeInputs(changesArtifact.items));
+  // Hybrid approach: heuristics for scores, LLM for driver descriptions
+  logger.info({ sessionId, changeCount: changesArtifact.items.length }, 'Analyzing hotspots (hybrid)');
+  return runHybridHotspots(ctx, changesArtifact);
+}
 
-    const artifact: HotspotsArtifact = {
-      sessionId,
-      items: analysis.hotspots.map((h, idx) => ({
-        id: `hotspot-${idx + 1}`,
-        rank: idx + 1,
-        area: h.area,
-        score: h.score,
-        drivers: h.drivers,
-        contributingPrs: h.contributingPrs,
-      })),
-    };
+async function runHybridHotspots(ctx: SessionContext, changesArtifact: ChangesArtifact): Promise<HotspotsArtifact> {
+  const { db, sessionId } = ctx;
+  const agent = getAnalysisAgent();
 
-    await upsertArtifact(db, sessionId, 'hotspots', artifact);
-    await setJob(db, sessionId, 'analyze-hotspots', 'completed', 100);
-    logger.info({ sessionId, hotspotCount: artifact.items.length }, 'Analysis complete');
+  // Step 1: Calculate hotspots using heuristics (fast, reliable)
+  const heuristics = agent
+    ? agent.generateHotspotsHeuristic(toChangeInputs(changesArtifact.items))
+    : generateBasicHotspots(changesArtifact.items);
 
-    return artifact;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    logger.error({ err: error, sessionId }, 'Analysis failed');
-    await failJob(ctx, 'analyze-hotspots', msg, 'generate-testplan');
-    throw new Error(`LLM analysis failed: ${msg}`);
+  await setJob(db, sessionId, 'analyze-hotspots', 'running', 30);
+
+  // Step 2: Enhance top hotspots with LLM-generated drivers (one at a time)
+  const enhancedHotspots = [];
+  const topN = Math.min(heuristics.length, 5); // Only enhance top 5
+
+  for (let i = 0; i < heuristics.length; i++) {
+    const h = heuristics[i];
+    let drivers = h.drivers;
+
+    // Enhance top N hotspots with LLM if available
+    if (agent && i < topN && h._meta) {
+      try {
+        drivers = await agent.enhanceHotspotDrivers(h);
+        logger.debug({ area: h.area }, 'Enhanced hotspot drivers with LLM');
+      } catch (error) {
+        logger.warn({ err: error, area: h.area }, 'LLM enhancement failed, using heuristic drivers');
+      }
+    }
+
+    enhancedHotspots.push({
+      id: `hotspot-${i + 1}`,
+      rank: i + 1,
+      area: h.area,
+      score: h.score,
+      drivers,
+      contributingPrs: h.contributingPrs,
+    });
+
+    // Update progress
+    if (i < topN) {
+      await setJob(db, sessionId, 'analyze-hotspots', 'running', 30 + Math.round((i + 1) / topN * 60));
+    }
   }
+
+  const artifact: HotspotsArtifact = {
+    sessionId,
+    items: enhancedHotspots,
+  };
+
+  await upsertArtifact(db, sessionId, 'hotspots', artifact);
+  await setJob(db, sessionId, 'analyze-hotspots', 'completed', 100);
+  logger.info({ sessionId, hotspotCount: artifact.items.length }, 'Hybrid analysis complete');
+
+  return artifact;
+}
+
+function generateBasicHotspots(items: any[]): Array<{
+  area: string;
+  score: number;
+  drivers: string[];
+  contributingPrs: number[];
+  _meta?: {
+    prCount: number;
+    totalFiles: number;
+    totalChurn: number;
+    highRiskCount: number;
+    signals: string[];
+  };
+}> {
+  const byArea = new Map<string, { prs: number[]; totalFiles: number; totalChurn: number; highRiskCount: number; signals: Set<string> }>();
+
+  for (const item of items) {
+    const existing = byArea.get(item.area) || { prs: [], totalFiles: 0, totalChurn: 0, highRiskCount: 0, signals: new Set<string>() };
+    existing.prs.push(item.number);
+    existing.totalFiles += item.filesChanged || 0;
+    existing.totalChurn += (item.additions || 0) + (item.deletions || 0);
+    if (item.risk === 'High') existing.highRiskCount++;
+    for (const signal of item.signals || []) {
+      existing.signals.add(signal);
+    }
+    byArea.set(item.area, existing);
+  }
+
+  return Array.from(byArea.entries())
+    .map(([area, data]) => {
+      const score = Math.min(100, data.prs.length * 10 + Math.floor(data.totalChurn / 100));
+      return {
+        area,
+        score,
+        drivers: [`${data.prs.length} PRs`, `${data.totalFiles} files changed`, `${data.totalChurn} lines modified`],
+        contributingPrs: data.prs.slice(0, 10),
+        _meta: {
+          prCount: data.prs.length,
+          totalFiles: data.totalFiles,
+          totalChurn: data.totalChurn,
+          highRiskCount: data.highRiskCount,
+          signals: Array.from(data.signals),
+        },
+      };
+    })
+    .sort((a, b) => b.score - a.score);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -446,7 +534,7 @@ async function runGenerateTestPlan(
   ctx: SessionContext,
   changesArtifact: ChangesArtifact,
   hotspotsArtifact: HotspotsArtifact
-): Promise<TestPlanArtifact> {
+): Promise<TestPlanArtifact | null> {
   const { db, sessionId } = ctx;
 
   const existing = await getArtifact(db, sessionId, 'test-plan');
@@ -460,9 +548,11 @@ async function runGenerateTestPlan(
 
   const agent = getTestPlanAgent();
   if (!agent) {
-    logger.error({ sessionId }, 'LLM not configured for test plan');
-    await failJob(ctx, 'generate-testplan', 'LLM not configured');
-    throw new Error('LLM not configured for test plan generation');
+    logger.warn({ sessionId }, 'LLM not configured for test plan, skipping');
+    const artifact: TestPlanArtifact = { sessionId, sections: [] };
+    await upsertArtifact(db, sessionId, 'test-plan', artifact);
+    await setJob(db, sessionId, 'generate-testplan', 'completed', 100);
+    return artifact;
   }
 
   if (!changesArtifact.items?.length) {
@@ -502,7 +592,7 @@ async function runGenerateTestPlan(
     const msg = error instanceof Error ? error.message : String(error);
     logger.error({ err: error, sessionId }, 'Test plan generation failed');
     await failJob(ctx, 'generate-testplan', msg);
-    throw new Error(`LLM test plan generation failed: ${msg}`);
+    return null;
   }
 }
 
@@ -528,13 +618,44 @@ export async function runSession(db: Db, sessionId: string) {
 
   await setSessionStatus(db, sessionId, 'generating');
 
+  // Job 1: Parse Changes
   const changesArtifact = await runParseChanges(ctx);
+  if (!changesArtifact) {
+    // Already marked as failed with subsequent jobs skipped
+    logger.error({ sessionId }, 'Session failed at parse-changes');
+    return;
+  }
+
+  // Job 2: Generate Notes (independent of hotspots/testplan)
   await runGenerateNotes(ctx, changesArtifact);
+  // Note: generate-notes failure doesn't block hotspots/testplan
+
+  // Job 3: Analyze Hotspots
   const hotspotsArtifact = await runAnalyzeHotspots(ctx, changesArtifact);
+  if (!hotspotsArtifact) {
+    // Hotspots failed but was not expected to (fallback should have worked)
+    logger.error({ sessionId }, 'Session failed at analyze-hotspots');
+    await setJob(db, sessionId, 'generate-testplan', 'skipped', 0, 'Skipped: analyze-hotspots failed');
+    return;
+  }
+
+  // Job 4: Generate Test Plan
   await runGenerateTestPlan(ctx, changesArtifact, hotspotsArtifact);
 
-  await setSessionStatus(db, sessionId, 'ready');
-  logger.info({ sessionId }, 'Session completed');
+  // Check if any job failed
+  const jobsResult = await db.pool.query(
+    `SELECT status FROM jobs WHERE session_id = $1`,
+    [sessionId]
+  );
+  const anyFailed = jobsResult.rows.some((j: { status: string }) => j.status === 'failed');
+
+  if (anyFailed) {
+    // Status already set to 'failed' by failJob
+    logger.warn({ sessionId }, 'Session completed with failures');
+  } else {
+    await setSessionStatus(db, sessionId, 'ready');
+    logger.info({ sessionId }, 'Session completed successfully');
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
