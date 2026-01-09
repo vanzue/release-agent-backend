@@ -56,7 +56,9 @@ export async function syncIssues(
 
   logger.info({ repoFullName, since, lastIssueNumber, fullSync }, 'Syncing issues');
 
-  let maxUpdatedAt = since ?? null;
+  // Always update lastSyncedAt to current time to mark when we ran the sync
+  // (incremental syncs may refetch older issues, so we can't rely on max issue.updated_at)
+  let maxUpdatedAt = new Date().toISOString();
   let maxIssueNumber = lastIssueNumber ?? null;
   
   // For resume: count how many issues we already have in DB
@@ -110,7 +112,7 @@ export async function syncIssues(
       }
     }
 
-    if (!maxUpdatedAt || issue.updated_at > maxUpdatedAt) maxUpdatedAt = issue.updated_at;
+    // Track max issue number for resume capability
     if (!maxIssueNumber || issue.number > maxIssueNumber) maxIssueNumber = issue.number;
 
     processed++;
