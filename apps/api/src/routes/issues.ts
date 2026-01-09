@@ -3,6 +3,48 @@ import type { PgStore } from '../store/pg.js';
 import type { IssueReclusterRequest, IssueSyncRequest } from '@release-agent/contracts';
 import { createIssueReclusterEnqueuer, createIssueSyncEnqueuer } from '../queue.js';
 
+// Embedding helper (inline to avoid worker dependency)
+async function embedTextForSearch(text: string): Promise<number[]> {
+  const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
+  const apiKey = process.env.AZURE_OPENAI_API_KEY;
+  const apiVersion = process.env.AZURE_OPENAI_API_VERSION;
+  const modelId = process.env.ISSUE_EMBEDDING_MODEL_ID;
+  
+  if (!endpoint || !apiKey || !modelId) {
+    throw new Error('Missing Azure OpenAI configuration for embeddings');
+  }
+
+  const baseURL = endpoint.replace(/\/?$/, '/');
+  const url = apiVersion
+    ? `${baseURL}openai/deployments/${encodeURIComponent(modelId)}/embeddings?api-version=${encodeURIComponent(apiVersion)}`
+    : `${baseURL}openai/v1/embeddings`;
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'api-key': apiKey,
+    },
+    body: JSON.stringify({
+      ...(apiVersion ? {} : { model: modelId }),
+      input: text,
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Azure OpenAI embeddings error ${res.status}: ${body}`);
+  }
+
+  const data = (await res.json()) as any;
+  const embedding = data?.data?.[0]?.embedding;
+  if (!Array.isArray(embedding)) {
+    throw new Error('Invalid embeddings response');
+  }
+
+  return embedding.map((n: any) => Number(n));
+}
+
 function parseVersionKey(v: string): [number, number, number] | null {
   const m = v.match(/^(\d+)\.(\d+)(?:\.(\d+))?$/);
   if (!m) return null;
@@ -200,5 +242,144 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
     });
 
     return { targetVersion: resolvedTargetVersion ?? null, issues };
+  });
+
+  /**
+   * Find issues similar to a given issue based on embedding similarity.
+   * Query params:
+   *   - repo: repository full name (required)
+   *   - issueNumber: the issue to find similar issues for (required)
+   *   - productLabel: filter to same product label (optional)
+   *   - minSimilarity: minimum similarity threshold, default 0.85 (optional)
+   *   - limit: max results, default 10 (optional)
+   */
+  server.get('/issues/:issueNumber/similar', async (req, reply) => {
+    const { issueNumber } = req.params as { issueNumber: string };
+    const { repo, productLabel, minSimilarity, limit } = req.query as {
+      repo: string;
+      productLabel?: string;
+      minSimilarity?: string;
+      limit?: string;
+    };
+
+    if (!repo) {
+      return reply.code(400).send({ message: 'repo query parameter is required' });
+    }
+
+    const issueNum = Number.parseInt(issueNumber, 10);
+    if (Number.isNaN(issueNum)) {
+      return reply.code(400).send({ message: 'Invalid issue number' });
+    }
+
+    const minSim = minSimilarity ? Number.parseFloat(minSimilarity) : undefined;
+    const limitNum = limit ? Number.parseInt(limit, 10) : undefined;
+
+    const similarIssues = await store.findSimilarIssues({
+      repoFullName: repo,
+      issueNumber: issueNum,
+      productLabel,
+      minSimilarity: minSim,
+      limit: limitNum,
+    });
+
+    return {
+      issueNumber: issueNum,
+      productLabel: productLabel ?? null,
+      minSimilarity: minSim ?? 0.85,
+      similarIssues,
+    };
+  });
+
+  /**
+   * Semantic search for issues.
+   * Supports two modes:
+   * 1. By issue number: uses the issue's embedding
+   * 2. By query text: embeds the text on-the-fly and searches
+   * 
+   * Query params:
+   *   - repo: repository full name (required)
+   *   - issueNumber: find similar issues to this issue (optional)
+   *   - q: text query to embed and search (optional, used if issueNumber not provided)
+   *   - productLabel: filter to specific product label (optional)
+   *   - minSimilarity: minimum similarity threshold, default 0.80 (optional)
+   *   - limit: max results, default 20 (optional)
+   */
+  server.get('/issues/semantic-search', async (req, reply) => {
+    const { repo, issueNumber, q, productLabel, minSimilarity, limit } = req.query as {
+      repo: string;
+      issueNumber?: string;
+      q?: string;
+      productLabel?: string;
+      minSimilarity?: string;
+      limit?: string;
+    };
+
+    if (!repo) {
+      return reply.code(400).send({ message: 'repo query parameter is required' });
+    }
+
+    const minSim = minSimilarity ? Number.parseFloat(minSimilarity) : 0.80;
+    const limitNum = limit ? Number.parseInt(limit, 10) : 20;
+    
+    // Normalize productLabel: if it doesn't start with 'Product-', add the prefix
+    const normalizedProductLabel = productLabel && !productLabel.startsWith('Product-') 
+      ? `Product-${productLabel}`
+      : productLabel;
+
+    // Mode 1: Search by issue number
+    if (issueNumber) {
+      const issueNum = Number.parseInt(issueNumber, 10);
+      if (Number.isNaN(issueNum)) {
+        return reply.code(400).send({ message: 'Invalid issue number' });
+      }
+
+      const similarIssues = await store.findSimilarIssues({
+        repoFullName: repo,
+        issueNumber: issueNum,
+        productLabel: normalizedProductLabel,
+        minSimilarity: minSim,
+        limit: limitNum,
+      });
+
+      return {
+        mode: 'issue',
+        issueNumber: issueNum,
+        query: null,
+        productLabel: normalizedProductLabel ?? null,
+        minSimilarity: minSim,
+        results: similarIssues,
+      };
+    }
+
+    // Mode 2: Search by text query
+    if (q && q.trim()) {
+      const queryText = q.trim();
+      
+      try {
+        const embedding = await embedTextForSearch(queryText);
+        
+        const results = await store.searchIssuesByEmbedding({
+          repoFullName: repo,
+          embedding,
+          productLabel: normalizedProductLabel,
+          minSimilarity: minSim,
+          limit: limitNum,
+        });
+
+        return {
+          mode: 'query',
+          issueNumber: null,
+          query: queryText,
+          productLabel: normalizedProductLabel ?? null,
+          minSimilarity: minSim,
+          results,
+        };
+      } catch (e: any) {
+        req.log.error({ err: e }, 'Semantic search embedding failed');
+        return reply.code(500).send({ message: e.message ?? 'Embedding failed' });
+      }
+    }
+
+    return reply.code(400).send({ message: 'Either issueNumber or q (query) is required' });
   });
 }

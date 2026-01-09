@@ -60,7 +60,12 @@ $workerImage = "$acrLoginServer/release-agent-worker:$ImageTag"
 if (-not $SkipSecrets) {
   Write-Host "Setting secrets on Container Apps..." -ForegroundColor Cyan
 
-  az containerapp secret set -g $ResourceGroup -n $ApiAppName --secrets database-url="$DatabaseUrl" servicebus-conn="$ServiceBusConnectionString" -o none
+  # Build API secrets - include Azure OpenAI key if provided
+  $apiSecrets = "database-url=$DatabaseUrl", "servicebus-conn=$ServiceBusConnectionString"
+  if ($AzureOpenAiApiKey) {
+    $apiSecrets += "azure-openai-key=$AzureOpenAiApiKey"
+  }
+  az containerapp secret set -g $ResourceGroup -n $ApiAppName --secrets @apiSecrets -o none
   Assert-LastExit "Failed to set API secrets"
 
   # Build worker secrets - conditionally include Azure OpenAI key if provided
@@ -73,18 +78,33 @@ if (-not $SkipSecrets) {
 }
 
 Write-Host "Updating API image + env vars..." -ForegroundColor Cyan
+
+# Build API env vars
+$apiEnvVars = @(
+  "PORT=8080",
+  "HOST=0.0.0.0",
+  "DATABASE_URL=secretref:database-url",
+  "SERVICEBUS_CONNECTION_STRING=secretref:servicebus-conn",
+  "SERVICEBUS_SESSION_RUN_QUEUE=$ServiceBusQueueName",
+  "DB_POOL_MAX=10",
+  "CORS_ORIGIN=$CorsOrigin"
+)
+
+if ($IssueEmbeddingModelId) {
+  $apiEnvVars += "ISSUE_EMBEDDING_MODEL_ID=$IssueEmbeddingModelId"
+}
+if ($AzureOpenAiEndpoint) {
+  $apiEnvVars += "AZURE_OPENAI_ENDPOINT=$AzureOpenAiEndpoint"
+}
+if ($AzureOpenAiApiKey) {
+  $apiEnvVars += "AZURE_OPENAI_API_KEY=secretref:azure-openai-key"
+}
+
 az containerapp update `
   -g $ResourceGroup `
   -n $ApiAppName `
   --image $apiImage `
-  --set-env-vars `
-    PORT=8080 `
-    HOST=0.0.0.0 `
-    DATABASE_URL=secretref:database-url `
-    SERVICEBUS_CONNECTION_STRING=secretref:servicebus-conn `
-    SERVICEBUS_SESSION_RUN_QUEUE=$ServiceBusQueueName `
-    DB_POOL_MAX=10 `
-    CORS_ORIGIN="$CorsOrigin" `
+  --set-env-vars @apiEnvVars `
   -o none
 Assert-LastExit "Failed to update API app"
 

@@ -494,6 +494,139 @@ export function createPgStore(db: Db) {
       };
     },
 
+    async findSimilarIssues(input: {
+      repoFullName: string;
+      issueNumber: number;
+      productLabel?: string;
+      minSimilarity?: number; // default 0.85
+      limit?: number; // default 10
+    }): Promise<
+      Array<{
+        issueNumber: number;
+        title: string;
+        state: 'open' | 'closed';
+        similarity: number;
+        productLabels: string[];
+        updatedAt: string;
+      }>
+    > {
+      const minSim = input.minSimilarity ?? 0.85;
+      const limit = Math.min(input.limit ?? 10, 100);
+
+      // Build the HAVING clause for product label filtering
+      const productFilter = input.productLabel
+        ? `having array_agg(distinct p.product_label) @> $5`
+        : '';
+
+      const sql = `
+        with target as (
+          select embedding
+          from issues
+          where repo = $1 and issue_number = $2 and embedding is not null
+        )
+        select
+          i.issue_number,
+          i.title,
+          i.state,
+          i.updated_at,
+          1 - (i.embedding <=> t.embedding) as similarity,
+          coalesce(array_agg(distinct p.product_label) filter (where p.product_label is not null), '{}') as product_labels
+        from issues i
+        cross join target t
+        left join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
+        where i.repo = $1
+          and i.issue_number <> $2
+          and i.embedding is not null
+          and 1 - (i.embedding <=> t.embedding) >= $3
+        group by i.issue_number, i.title, i.state, i.updated_at, i.embedding, t.embedding
+        ${productFilter}
+        order by similarity desc
+        limit $4
+      `;
+
+      const params = input.productLabel
+        ? [input.repoFullName, input.issueNumber, minSim, limit, [input.productLabel]]
+        : [input.repoFullName, input.issueNumber, minSim, limit];
+
+      const res = await db.pool.query(sql, params);
+      return res.rows.map((r: any) => ({
+        issueNumber: Number(r.issue_number),
+        title: r.title as string,
+        state: r.state as 'open' | 'closed',
+        similarity: Number(r.similarity ?? 0),
+        productLabels: (r.product_labels as string[]) ?? [],
+        updatedAt: r.updated_at as string,
+      }));
+    },
+
+    /**
+     * Search issues by embedding vector (for semantic search with pre-computed embeddings).
+     */
+    async searchIssuesByEmbedding(input: {
+      repoFullName: string;
+      embedding: number[];
+      productLabel?: string;
+      minSimilarity?: number; // default 0.85
+      limit?: number; // default 20
+    }): Promise<
+      Array<{
+        issueNumber: number;
+        title: string;
+        state: 'open' | 'closed';
+        similarity: number;
+        productLabels: string[];
+        updatedAt: string;
+      }>
+    > {
+      const minSim = input.minSimilarity ?? 0.85;
+      const limit = Math.min(input.limit ?? 20, 100);
+
+      // Convert embedding array to pgvector literal format
+      const embeddingLiteral = `[${input.embedding.map((v) => (Number.isFinite(v) ? v : 0)).join(',')}]`;
+
+      const params: any[] = [input.repoFullName, embeddingLiteral, minSim];
+      
+      let productFilter = '';
+      if (input.productLabel) {
+        params.push([input.productLabel]);
+        productFilter = `having array_agg(distinct p.product_label) @> $${params.length}`;
+      }
+
+      const sql = `
+        select
+          i.issue_number,
+          i.title,
+          i.state,
+          i.updated_at,
+          1 - (i.embedding <=> $2::vector) as similarity,
+          coalesce(array_agg(distinct p.product_label) filter (where p.product_label is not null), '{}') as product_labels
+        from issues i
+        left join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
+        where i.repo = $1
+          and i.embedding is not null
+          and 1 - (i.embedding <=> $2::vector) >= $3
+        group by i.issue_number, i.title, i.state, i.updated_at, i.embedding
+        ${productFilter}
+        order by similarity desc
+        limit $${params.length + 1}
+      `;
+
+      params.push(limit);
+      const res = await db.pool.query(sql, params);
+      return res.rows.map((r: any) => ({
+        issueNumber: Number(r.issue_number),
+        title: r.title as string,
+        state: r.state as 'open' | 'closed',
+        similarity: Number(r.similarity ?? 0),
+        productLabels: (r.product_labels as string[]) ?? [],
+        updatedAt: r.updated_at as string,
+      }));
+    },
+
+    /**
+     * Find issues similar to a given issue based on embedding cosine similarity.
+     * Optionally filter by product label. Returns top N issues with similarity > minSimilarity.
+     */
     async getTopIssuesByReactions(input: {
       repoFullName: string;
       targetVersion: string | null | undefined; // undefined = all versions
