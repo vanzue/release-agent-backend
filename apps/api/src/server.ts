@@ -66,7 +66,7 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   registerHealthRoutes(server);
   await registerDocsRoutes(server);
-  registerAuthRoutes(server);
+  registerAuthRoutes(server, accessControl);
   registerSessionRoutes(server, store);
   registerIssueRoutes(server, store);
 

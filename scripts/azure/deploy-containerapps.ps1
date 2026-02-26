@@ -25,6 +25,13 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$WorkerGitHubToken,
 
+  # OAuth / auth-session secrets
+  [string]$GitHubOAuthClientId = "",
+  [string]$GitHubOAuthClientSecret = "",
+  [string]$GitHubOAuthCallbackUrl = "",
+  [string]$AuthFrontendBaseUrl = "",
+  [string]$AuthAppTokenSecret = "",
+
   # LLM Configuration
   [string]$LlmProvider = "azure",
   [string]$LlmModel = "",
@@ -60,10 +67,16 @@ $workerImage = "$acrLoginServer/release-agent-worker:$ImageTag"
 if (-not $SkipSecrets) {
   Write-Host "Setting secrets on Container Apps..." -ForegroundColor Cyan
 
-  # Build API secrets - include Azure OpenAI key if provided
+  # Build API secrets - include optional OAuth/OpenAI secrets
   $apiSecrets = "database-url=$DatabaseUrl", "servicebus-conn=$ServiceBusConnectionString"
   if ($AzureOpenAiApiKey) {
     $apiSecrets += "azure-openai-key=$AzureOpenAiApiKey"
+  }
+  if ($GitHubOAuthClientSecret) {
+    $apiSecrets += "github-oauth-client-secret=$GitHubOAuthClientSecret"
+  }
+  if ($AuthAppTokenSecret) {
+    $apiSecrets += "auth-app-token-secret=$AuthAppTokenSecret"
   }
   az containerapp secret set -g $ResourceGroup -n $ApiAppName --secrets @apiSecrets -o none
   Assert-LastExit "Failed to set API secrets"
@@ -92,6 +105,21 @@ $apiEnvVars = @(
 
 if ($IssueEmbeddingModelId) {
   $apiEnvVars += "ISSUE_EMBEDDING_MODEL_ID=$IssueEmbeddingModelId"
+}
+if ($GitHubOAuthClientId) {
+  $apiEnvVars += "GITHUB_OAUTH_CLIENT_ID=$GitHubOAuthClientId"
+}
+if ($GitHubOAuthClientSecret) {
+  $apiEnvVars += "GITHUB_OAUTH_CLIENT_SECRET=secretref:github-oauth-client-secret"
+}
+if ($GitHubOAuthCallbackUrl) {
+  $apiEnvVars += "GITHUB_OAUTH_CALLBACK_URL=$GitHubOAuthCallbackUrl"
+}
+if ($AuthFrontendBaseUrl) {
+  $apiEnvVars += "AUTH_FRONTEND_BASE_URL=$AuthFrontendBaseUrl"
+}
+if ($AuthAppTokenSecret) {
+  $apiEnvVars += "AUTH_APP_TOKEN_SECRET=secretref:auth-app-token-secret"
 }
 if ($AzureOpenAiEndpoint) {
   $apiEnvVars += "AZURE_OPENAI_ENDPOINT=$AzureOpenAiEndpoint"

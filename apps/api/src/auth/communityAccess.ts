@@ -1,6 +1,6 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
-type ViewerSource = 'community-md' | 'extra-allowlist' | 'access-control-disabled';
+export type ViewerSource = 'community-md' | 'extra-allowlist' | 'access-control-disabled';
 
 type AccessDecision =
   | {
@@ -23,6 +23,15 @@ type CommunityCache = {
   etag: string | null;
   expiresAt: number;
   members: Set<string>;
+};
+
+type TokenPayload = {
+  typ: 'oauth-state' | 'session';
+  iat: number;
+  exp: number;
+  login?: string;
+  source?: ViewerSource;
+  returnTo?: string;
 };
 
 function parseBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
@@ -63,15 +72,12 @@ function parseBearerToken(headerValue: string | undefined): string | null {
 function parseCommunityMembersFromMarkdown(md: string): Set<string> {
   const members = new Set<string>();
 
-  // Preferred pattern in PowerToys COMMUNITY.md:
-  // [@login](https://github.com/login)
   const explicitMentionPattern = /\[@([A-Za-z0-9-]+)\]\(https:\/\/github\.com\/([A-Za-z0-9-]+)\/?\)/gim;
   for (const match of md.matchAll(explicitMentionPattern)) {
     const login = (match[2] ?? match[1] ?? '').trim().toLowerCase();
     if (login) members.add(login);
   }
 
-  // Defensive fallback: any GitHub profile links.
   if (members.size === 0) {
     const githubProfilePattern = /https:\/\/github\.com\/([A-Za-z0-9-]+)\/?/gim;
     for (const match of md.matchAll(githubProfilePattern)) {
@@ -81,6 +87,78 @@ function parseCommunityMembersFromMarkdown(md: string): Set<string> {
   }
 
   return members;
+}
+
+function base64UrlEncode(input: Buffer | string): string {
+  const buffer = Buffer.isBuffer(input) ? input : Buffer.from(input);
+  return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function base64UrlDecodeToBuffer(input: string): Buffer | null {
+  if (!input) return null;
+  const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
+  const padding = normalized.length % 4 === 0 ? '' : '='.repeat(4 - (normalized.length % 4));
+  try {
+    return Buffer.from(normalized + padding, 'base64');
+  } catch {
+    return null;
+  }
+}
+
+function base64UrlDecodeToString(input: string): string | null {
+  const buffer = base64UrlDecodeToBuffer(input);
+  return buffer ? buffer.toString('utf-8') : null;
+}
+
+function buildSignedToken(payload: TokenPayload, secret: string): string {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const data = `${encodedHeader}.${encodedPayload}`;
+  const signature = createHmac('sha256', secret).update(data).digest();
+  return `${data}.${base64UrlEncode(signature)}`;
+}
+
+function verifySignedToken(token: string, secret: string): TokenPayload | null {
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+
+  const [encodedHeader, encodedPayload, encodedSig] = parts;
+  if (!encodedHeader || !encodedPayload || !encodedSig) return null;
+
+  const data = `${encodedHeader}.${encodedPayload}`;
+  const expectedSig = createHmac('sha256', secret).update(data).digest();
+  const providedSig = base64UrlDecodeToBuffer(encodedSig);
+  if (!providedSig) return null;
+  if (providedSig.length !== expectedSig.length) return null;
+  if (!timingSafeEqual(providedSig, expectedSig)) return null;
+
+  const payloadText = base64UrlDecodeToString(encodedPayload);
+  if (!payloadText) return null;
+
+  let payload: any;
+  try {
+    payload = JSON.parse(payloadText);
+  } catch {
+    return null;
+  }
+
+  if (!payload || typeof payload !== 'object') return null;
+  if (typeof payload.typ !== 'string') return null;
+  if (typeof payload.exp !== 'number' || typeof payload.iat !== 'number') return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.exp <= now) return null;
+
+  return payload as TokenPayload;
+}
+
+function normalizeReturnToPath(value: string | undefined): string {
+  const raw = (value ?? '').trim();
+  if (!raw) return '/';
+  if (!raw.startsWith('/')) return '/';
+  if (raw.startsWith('//')) return '/';
+  return raw;
 }
 
 async function fetchGithubLoginFromToken(token: string): Promise<string | null> {
@@ -117,14 +195,33 @@ export function createCommunityAccessController() {
     process.env.ACCESS_CONTROL_COMMUNITY_CACHE_SECONDS,
     600
   );
-  const tokenCacheTtlSeconds = parsePositiveIntEnv(
-    process.env.ACCESS_CONTROL_TOKEN_CACHE_SECONDS,
-    300
-  );
-  const extraAllowlist = parseCsvLowerSet(process.env.ACCESS_CONTROL_EXTRA_LOGINS);
+  const patCacheTtlSeconds = parsePositiveIntEnv(process.env.ACCESS_CONTROL_TOKEN_CACHE_SECONDS, 300);
+  const sessionTokenTtlSeconds = parsePositiveIntEnv(process.env.AUTH_SESSION_TTL_SECONDS, 43200);
+  const oauthStateTtlSeconds = parsePositiveIntEnv(process.env.AUTH_OAUTH_STATE_TTL_SECONDS, 600);
 
-  const tokenDecisionCache = new Map<string, CachedDecision>();
+  const extraAllowlist = parseCsvLowerSet(process.env.ACCESS_CONTROL_EXTRA_LOGINS);
+  const oauthClientId = process.env.GITHUB_OAUTH_CLIENT_ID?.trim() ?? '';
+  const oauthClientSecret = process.env.GITHUB_OAUTH_CLIENT_SECRET?.trim() ?? '';
+  const oauthCallbackUrlConfigured = process.env.GITHUB_OAUTH_CALLBACK_URL?.trim() ?? '';
+  const frontendBaseUrlConfigured =
+    process.env.AUTH_FRONTEND_BASE_URL?.trim() ||
+    process.env.CORS_ORIGIN?.split(',')[0]?.trim() ||
+    '';
+  const appTokenSecret = process.env.AUTH_APP_TOKEN_SECRET?.trim() ?? '';
+
+  const patDecisionCache = new Map<string, CachedDecision>();
   let communityCache: CommunityCache | null = null;
+
+  function getFrontendBaseUrlOrThrow(): string {
+    if (!frontendBaseUrlConfigured) {
+      throw new Error('Missing AUTH_FRONTEND_BASE_URL');
+    }
+    return frontendBaseUrlConfigured;
+  }
+
+  function getOAuthCallbackUrl(apiOrigin: string): string {
+    return oauthCallbackUrlConfigured || `${apiOrigin}/auth/github/callback`;
+  }
 
   function tokenCacheKey(token: string): string {
     return createHash('sha256').update(token).digest('hex');
@@ -137,7 +234,9 @@ export function createCommunityAccessController() {
       path === '/healthz' ||
       path === '/docs' ||
       path === '/openapi.yaml' ||
-      path.startsWith('/docs/')
+      path.startsWith('/docs/') ||
+      path === '/auth/github/start' ||
+      path === '/auth/github/callback'
     );
   }
 
@@ -181,13 +280,192 @@ export function createCommunityAccessController() {
         members,
       };
       return members;
-    } catch (err) {
+    } catch {
       if (communityCache) {
-        // Fallback to stale cache when refresh fails.
         return communityCache.members;
       }
-      throw err;
+      throw new Error('Unable to load community member list for authorization');
     }
+  }
+
+  async function classifyGithubLogin(login: string): Promise<{ source: ViewerSource } | { error: string; statusCode: number }> {
+    const normalizedLogin = login.toLowerCase();
+
+    if (extraAllowlist.has(normalizedLogin)) {
+      return { source: 'extra-allowlist' };
+    }
+
+    let members: Set<string>;
+    try {
+      members = await getCommunityMembers();
+    } catch (err: any) {
+      return { error: err?.message ?? 'Unable to load community member list for authorization', statusCode: 503 };
+    }
+
+    if (!members.has(normalizedLogin)) {
+      return {
+        error: `GitHub user @${login} is not in PowerToys COMMUNITY.md`,
+        statusCode: 403,
+      };
+    }
+
+    return { source: 'community-md' };
+  }
+
+  function createSessionToken(login: string, source: ViewerSource): string {
+    if (!appTokenSecret) {
+      throw new Error('Missing AUTH_APP_TOKEN_SECRET');
+    }
+    const now = Math.floor(Date.now() / 1000);
+    return buildSignedToken(
+      {
+        typ: 'session',
+        iat: now,
+        exp: now + sessionTokenTtlSeconds,
+        login,
+        source,
+      },
+      appTokenSecret
+    );
+  }
+
+  function verifySessionToken(token: string): { login: string; source: ViewerSource } | null {
+    if (!appTokenSecret) return null;
+    const payload = verifySignedToken(token, appTokenSecret);
+    if (!payload) return null;
+    if (payload.typ !== 'session') return null;
+    if (!payload.login || !payload.source) return null;
+    if (typeof payload.login !== 'string' || typeof payload.source !== 'string') return null;
+    const source = payload.source as ViewerSource;
+    if (source !== 'community-md' && source !== 'extra-allowlist') return null;
+    return { login: payload.login, source };
+  }
+
+  function createOAuthStateToken(returnToPath: string): string {
+    if (!appTokenSecret) {
+      throw new Error('Missing AUTH_APP_TOKEN_SECRET');
+    }
+    const now = Math.floor(Date.now() / 1000);
+    return buildSignedToken(
+      {
+        typ: 'oauth-state',
+        iat: now,
+        exp: now + oauthStateTtlSeconds,
+        returnTo: normalizeReturnToPath(returnToPath),
+      },
+      appTokenSecret
+    );
+  }
+
+  function verifyOAuthStateToken(token: string): { returnToPath: string } | null {
+    if (!appTokenSecret) return null;
+    const payload = verifySignedToken(token, appTokenSecret);
+    if (!payload || payload.typ !== 'oauth-state') return null;
+    return { returnToPath: normalizeReturnToPath(payload.returnTo) };
+  }
+
+  function buildFrontendRedirect(input: {
+    returnToPath?: string;
+    sessionToken?: string;
+    error?: string;
+  }): string {
+    const baseUrl = getFrontendBaseUrlOrThrow();
+    const targetUrl = new URL(normalizeReturnToPath(input.returnToPath), baseUrl);
+    const hash = new URLSearchParams();
+    if (input.sessionToken) hash.set('ra_token', input.sessionToken);
+    if (input.error) hash.set('ra_error', input.error);
+    if (hash.toString()) {
+      targetUrl.hash = hash.toString();
+    }
+    return targetUrl.toString();
+  }
+
+  function beginGithubOAuth(input: { apiOrigin: string; returnToPath?: string }): { redirectUrl: string } {
+    if (!enabled) {
+      throw new Error('Access control is disabled');
+    }
+    if (!oauthClientId) {
+      throw new Error('Missing GITHUB_OAUTH_CLIENT_ID');
+    }
+    if (!appTokenSecret) {
+      throw new Error('Missing AUTH_APP_TOKEN_SECRET');
+    }
+
+    const callbackUrl = getOAuthCallbackUrl(input.apiOrigin);
+    const returnToPath = normalizeReturnToPath(input.returnToPath);
+    const state = createOAuthStateToken(returnToPath);
+
+    const authUrl = new URL('https://github.com/login/oauth/authorize');
+    authUrl.searchParams.set('client_id', oauthClientId);
+    authUrl.searchParams.set('redirect_uri', callbackUrl);
+    authUrl.searchParams.set('scope', 'read:user');
+    authUrl.searchParams.set('state', state);
+
+    return { redirectUrl: authUrl.toString() };
+  }
+
+  async function completeGithubOAuth(input: {
+    apiOrigin: string;
+    code: string;
+    state: string;
+  }): Promise<{ login: string; source: ViewerSource; sessionToken: string; returnToPath: string }> {
+    if (!enabled) {
+      throw new Error('Access control is disabled');
+    }
+    if (!oauthClientId) throw new Error('Missing GITHUB_OAUTH_CLIENT_ID');
+    if (!oauthClientSecret) throw new Error('Missing GITHUB_OAUTH_CLIENT_SECRET');
+    if (!appTokenSecret) throw new Error('Missing AUTH_APP_TOKEN_SECRET');
+
+    const statePayload = verifyOAuthStateToken(input.state);
+    if (!statePayload) {
+      throw new Error('Invalid or expired OAuth state');
+    }
+
+    const callbackUrl = getOAuthCallbackUrl(input.apiOrigin);
+    const tokenRes: any = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+        'user-agent': 'release-agent-api',
+      },
+      body: JSON.stringify({
+        client_id: oauthClientId,
+        client_secret: oauthClientSecret,
+        code: input.code,
+        redirect_uri: callbackUrl,
+      }),
+    });
+
+    if (!tokenRes.ok) {
+      const text = await tokenRes.text().catch(() => '');
+      throw new Error(`GitHub OAuth token exchange failed (${tokenRes.status}): ${text}`);
+    }
+
+    const tokenBody = (await tokenRes.json()) as any;
+    const githubAccessToken =
+      typeof tokenBody?.access_token === 'string' ? tokenBody.access_token.trim() : '';
+    if (!githubAccessToken) {
+      throw new Error('GitHub OAuth token exchange did not return access_token');
+    }
+
+    const login = await fetchGithubLoginFromToken(githubAccessToken);
+    if (!login) {
+      throw new Error('Unable to resolve GitHub user from OAuth token');
+    }
+
+    const classResult = await classifyGithubLogin(login);
+    if ('error' in classResult) {
+      throw new Error(classResult.error);
+    }
+
+    const sessionToken = createSessionToken(login, classResult.source);
+    return {
+      login,
+      source: classResult.source,
+      sessionToken,
+      returnToPath: statePayload.returnToPath,
+    };
   }
 
   async function authorize(input: {
@@ -212,9 +490,18 @@ export function createCommunityAccessController() {
       };
     }
 
+    const sessionViewer = verifySessionToken(token);
+    if (sessionViewer) {
+      return {
+        allowed: true,
+        login: sessionViewer.login,
+        source: sessionViewer.source,
+      };
+    }
+
     const now = Date.now();
-    const key = tokenCacheKey(token);
-    const cached = tokenDecisionCache.get(key);
+    const cacheKey = tokenCacheKey(token);
+    const cached = patDecisionCache.get(cacheKey);
     if (cached && cached.expiresAt > now) {
       return cached.decision;
     }
@@ -224,49 +511,24 @@ export function createCommunityAccessController() {
       const denied: AccessDecision = {
         allowed: false,
         statusCode: 401,
-        message: 'Invalid GitHub token',
+        message: 'Invalid bearer token',
       };
-      tokenDecisionCache.set(key, {
-        expiresAt: now + tokenCacheTtlSeconds * 1000,
+      patDecisionCache.set(cacheKey, {
+        expiresAt: now + patCacheTtlSeconds * 1000,
         decision: denied,
       });
       return denied;
     }
 
-    const normalizedLogin = login.toLowerCase();
-
-    if (extraAllowlist.has(normalizedLogin)) {
-      const allowed: AccessDecision = {
-        allowed: true,
-        login,
-        source: 'extra-allowlist',
-      };
-      tokenDecisionCache.set(key, {
-        expiresAt: now + tokenCacheTtlSeconds * 1000,
-        decision: allowed,
-      });
-      return allowed;
-    }
-
-    let members: Set<string>;
-    try {
-      members = await getCommunityMembers();
-    } catch {
-      return {
-        allowed: false,
-        statusCode: 503,
-        message: 'Unable to load community member list for authorization',
-      };
-    }
-
-    if (!members.has(normalizedLogin)) {
+    const classResult = await classifyGithubLogin(login);
+    if ('error' in classResult) {
       const denied: AccessDecision = {
         allowed: false,
-        statusCode: 403,
-        message: `GitHub user @${login} is not in PowerToys COMMUNITY.md`,
+        statusCode: classResult.statusCode,
+        message: classResult.error,
       };
-      tokenDecisionCache.set(key, {
-        expiresAt: now + tokenCacheTtlSeconds * 1000,
+      patDecisionCache.set(cacheKey, {
+        expiresAt: now + patCacheTtlSeconds * 1000,
         decision: denied,
       });
       return denied;
@@ -275,10 +537,10 @@ export function createCommunityAccessController() {
     const allowed: AccessDecision = {
       allowed: true,
       login,
-      source: 'community-md',
+      source: classResult.source,
     };
-    tokenDecisionCache.set(key, {
-      expiresAt: now + tokenCacheTtlSeconds * 1000,
+    patDecisionCache.set(cacheKey, {
+      expiresAt: now + patCacheTtlSeconds * 1000,
       decision: allowed,
     });
     return allowed;
@@ -287,5 +549,10 @@ export function createCommunityAccessController() {
   return {
     enabled,
     authorize,
+    beginGithubOAuth,
+    completeGithubOAuth,
+    buildFrontendRedirect,
   };
 }
+
+export type CommunityAccessController = ReturnType<typeof createCommunityAccessController>;
