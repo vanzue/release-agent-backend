@@ -26,4 +26,11 @@ export type GithubIssue = {
   pull_request?: unknown; // present when the item is a PR
 };
 
+export type GithubRelease = {
+  tag_name: string;
+  name: string | null;
+  html_url: string;
+  published_at: string | null;
+};
+
 export type { IssueSyncRequest, IssueReclusterRequest } from '@release-agent/contracts';

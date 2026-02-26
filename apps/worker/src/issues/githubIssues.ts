@@ -1,5 +1,5 @@
 import pino from 'pino';
-import type { GithubIssue } from './types.js';
+import type { GithubIssue, GithubRelease } from './types.js';
 import {
   isHttpRateLimitError,
   getRetryDelayFromHeaders,
@@ -9,6 +9,16 @@ import {
 } from '../retry.js';
 
 const logger = pino({ name: 'github-issues', level: process.env.LOG_LEVEL ?? 'info' });
+
+class GithubApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'GithubApiError';
+    this.status = status;
+  }
+}
 
 function requireGithubToken() {
   const token = process.env.GITHUB_TOKEN;
@@ -75,7 +85,7 @@ async function githubRequestWithHeaders<T>(path: string, init?: any): Promise<Gi
       }
       throw new Error(`GitHub API rate limit exceeded after ${config.maxAttempts} attempts: ${text}`);
     } else {
-      throw new Error(`GitHub API error ${res.status} ${res.statusText}: ${text}`);
+      throw new GithubApiError(res.status, `GitHub API error ${res.status} ${res.statusText}: ${text}`);
     }
   }
 
@@ -347,4 +357,18 @@ export async function listIssuesNewerThanNumber(options: {
   }
 
   return collected;
+}
+
+export async function getLatestRelease(options: { repoFullName: string }): Promise<GithubRelease | null> {
+  const { owner, repo } = parseRepoFullName(options.repoFullName);
+
+  try {
+    return await githubRequest<GithubRelease>(`/repos/${owner}/${repo}/releases/latest`);
+  } catch (error) {
+    if (error instanceof GithubApiError && error.status === 404) {
+      logger.warn({ repoFullName: options.repoFullName }, 'Latest release not found for repository');
+      return null;
+    }
+    throw error;
+  }
 }

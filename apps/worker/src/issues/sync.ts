@@ -1,7 +1,7 @@
 import pino from 'pino';
 import type { Db } from '../db.js';
-import { listIssuesUpdatedSince, streamIssuesByCreated, listIssuesNewerThanNumber } from './githubIssues.js';
-import { findReusableEmbedding, getIssueSyncState, setIssueSyncState, upsertIssue, replaceIssueProducts } from './issueStore.js';
+import { getLatestRelease, listIssuesUpdatedSince, streamIssuesByCreated, listIssuesNewerThanNumber } from './githubIssues.js';
+import { findReusableEmbedding, getIssueSyncState, setIssueSyncState, upsertIssue, replaceIssueProducts, upsertRepoLatestRelease } from './issueStore.js';
 import { extractPowertoysAreaProductLabels, extractPowertoysReportedVersion, normalizeAreaToProductLabel } from './powertoysTemplate.js';
 import type { IssueSyncRequest, GithubIssue } from './types.js';
 import { embedTextAzureOpenAI } from './embeddings.js';
@@ -42,6 +42,14 @@ function buildEmbeddingText(title: string, body: string | null): string {
   return `${title}\n\n${truncated}`.trim();
 }
 
+function extractVersionFromText(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const match = value.match(/(\d+)\.(\d+)(?:\.(\d+))?/);
+  if (!match) return null;
+  const patch = match[3];
+  return patch ? `${match[1]}.${match[2]}.${patch}` : `${match[1]}.${match[2]}`;
+}
+
 export async function syncIssues(
   db: Db,
   request: IssueSyncRequest,
@@ -55,6 +63,20 @@ export async function syncIssues(
   const lastIssueNumber = syncState.lastSyncedIssueNumber; // Always use for resume capability
 
   logger.info({ repoFullName, since, lastIssueNumber, fullSync }, 'Syncing issues');
+
+  try {
+    const latestRelease = await getLatestRelease({ repoFullName });
+    await upsertRepoLatestRelease(db, {
+      repoFullName,
+      tag: latestRelease?.tag_name ?? null,
+      name: latestRelease?.name ?? null,
+      url: latestRelease?.html_url ?? null,
+      version: extractVersionFromText(latestRelease?.tag_name) ?? extractVersionFromText(latestRelease?.name) ?? null,
+      publishedAt: latestRelease?.published_at ?? null,
+    });
+  } catch (e) {
+    logger.warn({ err: e, repoFullName }, 'Failed to refresh latest release metadata');
+  }
 
   // Always update lastSyncedAt to current time to mark when we ran the sync
   // (incremental syncs may refetch older issues, so we can't rely on max issue.updated_at)

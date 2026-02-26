@@ -65,6 +65,48 @@ export async function setIssueSyncState(
   );
 }
 
+export async function upsertRepoLatestRelease(
+  db: Db,
+  input: {
+    repoFullName: string;
+    tag: string | null;
+    name: string | null;
+    url: string | null;
+    version: string | null;
+    publishedAt: string | null;
+  }
+): Promise<void> {
+  await db.pool.query(
+    `
+    insert into repo_release_state (
+      repo,
+      latest_release_tag,
+      latest_release_name,
+      latest_release_url,
+      latest_release_version,
+      latest_release_published_at,
+      updated_at
+    )
+    values ($1, $2, $3, $4, $5, $6::timestamptz, now())
+    on conflict (repo) do update set
+      latest_release_tag = excluded.latest_release_tag,
+      latest_release_name = excluded.latest_release_name,
+      latest_release_url = excluded.latest_release_url,
+      latest_release_version = excluded.latest_release_version,
+      latest_release_published_at = excluded.latest_release_published_at,
+      updated_at = now()
+    `,
+    [
+      input.repoFullName,
+      input.tag,
+      input.name,
+      input.url,
+      input.version,
+      input.publishedAt,
+    ]
+  );
+}
+
 export function extractIssueType(labels: Array<{ name?: string }> | null | undefined): string | null {
   for (const l of labels ?? []) {
     const name = l?.name?.toLowerCase();

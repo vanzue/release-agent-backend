@@ -246,6 +246,28 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
     return stats;
   });
 
+  server.get('/issues/dashboard', async (req, reply) => {
+    const { repo, semanticLimit, issuesPerSemantic, minSimilarity } = req.query as {
+      repo?: string;
+      semanticLimit?: string;
+      issuesPerSemantic?: string;
+      minSimilarity?: string;
+    };
+
+    if (!repo) {
+      return reply.code(400).send({ message: 'repo query parameter is required' });
+    }
+
+    const dashboard = await store.getIssueDashboard({
+      repoFullName: repo,
+      semanticLimit: semanticLimit ? Number.parseInt(semanticLimit, 10) : undefined,
+      issuesPerSemantic: issuesPerSemantic ? Number.parseInt(issuesPerSemantic, 10) : undefined,
+      minSimilarity: minSimilarity ? Number.parseFloat(minSimilarity) : undefined,
+    });
+
+    return dashboard;
+  });
+
   server.get('/issues/top-by-reactions', async (req) => {
     const { repo, targetVersion, productLabel, limit } = req.query as {
       repo: string;

@@ -66,6 +66,69 @@ function mapJob(row: any): Job {
   };
 }
 
+function parseVersionTuple(version: string | null | undefined): [number, number, number] | null {
+  if (!version) return null;
+  const match = version.match(/^(\d+)\.(\d+)(?:\.(\d+))?$/);
+  if (!match) return null;
+  return [
+    Number.parseInt(match[1], 10),
+    Number.parseInt(match[2], 10),
+    Number.parseInt(match[3] ?? '0', 10),
+  ];
+}
+
+function compareVersionTuple(a: [number, number, number], b: [number, number, number]): number {
+  if (a[0] !== b[0]) return a[0] - b[0];
+  if (a[1] !== b[1]) return a[1] - b[1];
+  return a[2] - b[2];
+}
+
+function latestVersionFromList(versions: Array<string | null>): string | null {
+  let best: string | null = null;
+  let bestTuple: [number, number, number] | null = null;
+
+  for (const version of versions) {
+    const tuple = parseVersionTuple(version);
+    if (!tuple) continue;
+    if (!bestTuple || compareVersionTuple(tuple, bestTuple) > 0) {
+      best = version;
+      bestTuple = tuple;
+    }
+  }
+
+  return best;
+}
+
+function buildVersionCandidates(version: string | null): string[] {
+  if (!version) return [];
+  const tuple = parseVersionTuple(version);
+  if (!tuple) return [version];
+
+  const majorMinor = `${tuple[0]}.${tuple[1]}`;
+  const full = `${tuple[0]}.${tuple[1]}.${tuple[2]}`;
+  if (version === majorMinor) return [majorMinor, full];
+  return [full, majorMinor];
+}
+
+function pickPrimaryProductLabel(issues: Array<{ productLabels: string[] }>): string | null {
+  const scores = new Map<string, number>();
+  for (const issue of issues) {
+    for (const label of issue.productLabels) {
+      scores.set(label, (scores.get(label) ?? 0) + 1);
+    }
+  }
+
+  let bestLabel: string | null = null;
+  let bestScore = -1;
+  for (const [label, score] of scores.entries()) {
+    if (score > bestScore) {
+      bestLabel = label;
+      bestScore = score;
+    }
+  }
+  return bestLabel;
+}
+
 export function createPgStore(db: Db) {
   async function listSessions(): Promise<Session[]> {
     const res = await db.pool.query('select * from sessions order by created_at desc');
@@ -445,6 +508,300 @@ export function createPgStore(db: Db) {
         productLabels: (r.product_labels as string[] | null) ?? [],
         updatedAt: r.updated_at as string,
       }));
+    },
+
+    async getIssueDashboard(input: {
+      repoFullName: string;
+      semanticLimit?: number;
+      issuesPerSemantic?: number;
+      minSimilarity?: number;
+    }): Promise<{
+      latestRelease: {
+        tag: string | null;
+        name: string | null;
+        url: string | null;
+        publishedAt: string | null;
+        version: string | null;
+        versionCandidates: string[];
+        source: 'github_release' | 'issues_fallback' | 'none';
+      };
+      hottestIssue: {
+        issueNumber: number;
+        title: string;
+        state: 'open' | 'closed';
+        updatedAt: string;
+        reactionsCount: number;
+        commentsCount: number;
+        hotScore: number;
+        productLabels: string[];
+      } | null;
+      semanticGroups: Array<{
+        semanticId: string;
+        productLabel: string | null;
+        representativeIssueNumber: number;
+        representativeTitle: string;
+        hotScore: number;
+        issueCount: number;
+        openIssueCount: number;
+        issues: Array<{
+          issueNumber: number;
+          title: string;
+          state: 'open' | 'closed';
+          updatedAt: string;
+          reactionsCount: number;
+          commentsCount: number;
+          similarity: number;
+          productLabels: string[];
+        }>;
+      }>;
+      generatedAt: string;
+    }> {
+      const semanticLimit = Math.min(Math.max(input.semanticLimit ?? 6, 1), 12);
+      const issuesPerSemantic = Math.min(Math.max(input.issuesPerSemantic ?? 8, 2), 20);
+      const minSimilarity = input.minSimilarity ?? 0.84;
+
+      const releaseRes = await db.pool.query(
+        `
+        select
+          latest_release_tag,
+          latest_release_name,
+          latest_release_url,
+          latest_release_version,
+          latest_release_published_at
+        from repo_release_state
+        where repo = $1
+        `,
+        [input.repoFullName]
+      );
+      const releaseRow = releaseRes.rows[0];
+
+      let source: 'github_release' | 'issues_fallback' | 'none' = 'none';
+      let latestVersion = (releaseRow?.latest_release_version as string | null | undefined) ?? null;
+      if (latestVersion) {
+        source = 'github_release';
+      }
+
+      if (!latestVersion) {
+        const versionRes = await db.pool.query(
+          `
+          select target_version
+          from issues
+          where repo = $1 and target_version is not null
+          group by target_version
+          `,
+          [input.repoFullName]
+        );
+        latestVersion = latestVersionFromList(versionRes.rows.map((r: any) => r.target_version as string | null));
+        if (latestVersion) source = 'issues_fallback';
+      }
+
+      const versionCandidates = buildVersionCandidates(latestVersion);
+      if (versionCandidates.length === 0) {
+        return {
+          latestRelease: {
+            tag: (releaseRow?.latest_release_tag as string | null | undefined) ?? null,
+            name: (releaseRow?.latest_release_name as string | null | undefined) ?? null,
+            url: (releaseRow?.latest_release_url as string | null | undefined) ?? null,
+            publishedAt: (releaseRow?.latest_release_published_at as string | null | undefined) ?? null,
+            version: latestVersion,
+            versionCandidates: [],
+            source,
+          },
+          hottestIssue: null,
+          semanticGroups: [],
+          generatedAt: new Date().toISOString(),
+        };
+      }
+
+      const anchorScanLimit = Math.max(semanticLimit * 6, 20);
+      const anchorsRes = await db.pool.query(
+        `
+        select
+          i.issue_number,
+          i.title,
+          i.state,
+          i.updated_at,
+          i.reactions_total_count,
+          i.comments_count,
+          coalesce(array_agg(distinct p.product_label) filter (where p.product_label is not null), '{}') as product_labels,
+          (
+            3 * ln(1 + greatest(i.reactions_total_count, 0)) +
+            2 * ln(1 + greatest(i.comments_count, 0)) +
+            case when i.state = 'open' then 1 else 0 end
+          ) as hot_score
+        from issues i
+        left join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
+        where i.repo = $1
+          and i.target_version = any($2::text[])
+          and i.embedding is not null
+        group by
+          i.issue_number,
+          i.title,
+          i.state,
+          i.updated_at,
+          i.reactions_total_count,
+          i.comments_count
+        order by
+          case when i.state = 'open' then 0 else 1 end asc,
+          hot_score desc,
+          i.updated_at desc
+        limit $3
+        `,
+        [input.repoFullName, versionCandidates, anchorScanLimit]
+      );
+
+      const anchorRows = anchorsRes.rows.map((r: any) => ({
+        issueNumber: Number(r.issue_number),
+        title: r.title as string,
+        state: r.state as 'open' | 'closed',
+        updatedAt: r.updated_at as string,
+        reactionsCount: Number(r.reactions_total_count ?? 0),
+        commentsCount: Number(r.comments_count ?? 0),
+        hotScore: Number(r.hot_score ?? 0),
+        productLabels: (r.product_labels as string[] | null) ?? [],
+      }));
+
+      const seen = new Set<number>();
+      const semanticGroups: Array<{
+        semanticId: string;
+        productLabel: string | null;
+        representativeIssueNumber: number;
+        representativeTitle: string;
+        hotScore: number;
+        issueCount: number;
+        openIssueCount: number;
+        issues: Array<{
+          issueNumber: number;
+          title: string;
+          state: 'open' | 'closed';
+          updatedAt: string;
+          reactionsCount: number;
+          commentsCount: number;
+          similarity: number;
+          productLabels: string[];
+        }>;
+      }> = [];
+
+      for (const anchor of anchorRows) {
+        if (seen.has(anchor.issueNumber)) continue;
+
+        const overlapProducts = anchor.productLabels ?? [];
+        const requireOverlap = overlapProducts.length > 0;
+
+        const similarRes = await db.pool.query(
+          `
+          with anchor_issue as (
+            select embedding
+            from issues
+            where repo = $1 and issue_number = $2 and embedding is not null
+          )
+          select
+            i.issue_number,
+            i.title,
+            i.state,
+            i.updated_at,
+            i.reactions_total_count,
+            i.comments_count,
+            1 - (i.embedding <=> a.embedding) as similarity,
+            coalesce(array_agg(distinct p.product_label) filter (where p.product_label is not null), '{}') as product_labels
+          from issues i
+          cross join anchor_issue a
+          left join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
+          where i.repo = $1
+            and i.issue_number <> $2
+            and i.target_version = any($3::text[])
+            and i.embedding is not null
+            and 1 - (i.embedding <=> a.embedding) >= $4
+            and (
+              $5::boolean = false
+              or exists (
+                select 1
+                from issue_products p2
+                where p2.repo = i.repo
+                  and p2.issue_number = i.issue_number
+                  and p2.product_label = any($6::text[])
+              )
+            )
+          group by
+            i.issue_number,
+            i.title,
+            i.state,
+            i.updated_at,
+            i.reactions_total_count,
+            i.comments_count,
+            i.embedding,
+            a.embedding
+          order by similarity desc, i.updated_at desc
+          limit $7
+          `,
+          [
+            input.repoFullName,
+            anchor.issueNumber,
+            versionCandidates,
+            minSimilarity,
+            requireOverlap,
+            overlapProducts,
+            issuesPerSemantic - 1,
+          ]
+        );
+
+        const groupIssues = [
+          {
+            issueNumber: anchor.issueNumber,
+            title: anchor.title,
+            state: anchor.state,
+            updatedAt: anchor.updatedAt,
+            reactionsCount: anchor.reactionsCount,
+            commentsCount: anchor.commentsCount,
+            similarity: 1,
+            productLabels: anchor.productLabels,
+          },
+          ...similarRes.rows
+            .map((r: any) => ({
+              issueNumber: Number(r.issue_number),
+              title: r.title as string,
+              state: r.state as 'open' | 'closed',
+              updatedAt: r.updated_at as string,
+              reactionsCount: Number(r.reactions_total_count ?? 0),
+              commentsCount: Number(r.comments_count ?? 0),
+              similarity: Number(r.similarity ?? 0),
+              productLabels: (r.product_labels as string[] | null) ?? [],
+            }))
+            .filter((row) => !seen.has(row.issueNumber)),
+        ];
+
+        for (const issue of groupIssues) {
+          seen.add(issue.issueNumber);
+        }
+
+        semanticGroups.push({
+          semanticId: `${anchor.issueNumber}`,
+          productLabel: pickPrimaryProductLabel(groupIssues),
+          representativeIssueNumber: anchor.issueNumber,
+          representativeTitle: anchor.title,
+          hotScore: anchor.hotScore,
+          issueCount: groupIssues.length,
+          openIssueCount: groupIssues.filter((i) => i.state === 'open').length,
+          issues: groupIssues,
+        });
+
+        if (semanticGroups.length >= semanticLimit) break;
+      }
+
+      return {
+        latestRelease: {
+          tag: (releaseRow?.latest_release_tag as string | null | undefined) ?? null,
+          name: (releaseRow?.latest_release_name as string | null | undefined) ?? null,
+          url: (releaseRow?.latest_release_url as string | null | undefined) ?? null,
+          publishedAt: (releaseRow?.latest_release_published_at as string | null | undefined) ?? null,
+          version: latestVersion,
+          versionCandidates,
+          source,
+        },
+        hottestIssue: anchorRows[0] ?? null,
+        semanticGroups,
+        generatedAt: new Date().toISOString(),
+      };
     },
 
     async getIssueSyncStatus(repoFullName: string): Promise<{
