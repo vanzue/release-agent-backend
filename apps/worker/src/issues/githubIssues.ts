@@ -37,12 +37,12 @@ const GITHUB_RETRY_CONFIG: RetryConfig = {
   jitter: true,
 };
 
-async function githubRequestWithHeaders<T>(path: string, init?: RequestInit): Promise<GitHubResponse<T>> {
+async function githubRequestWithHeaders<T>(path: string, init?: any): Promise<GitHubResponse<T>> {
   const token = requireGithubToken();
   const config = GITHUB_RETRY_CONFIG;
 
   for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
-    const res = await fetch(`https://api.github.com${path}`, {
+    const res: any = await fetch(`https://api.github.com${path}`, {
       ...init,
       headers: {
         accept: 'application/vnd.github+json',
@@ -82,7 +82,7 @@ async function githubRequestWithHeaders<T>(path: string, init?: RequestInit): Pr
   throw new Error('GitHub API request failed after retries');
 }
 
-async function githubRequest<T>(path: string, init?: RequestInit): Promise<T> {
+async function githubRequest<T>(path: string, init?: any): Promise<T> {
   const result = await githubRequestWithHeaders<T>(path, init);
   return result.data;
 }

@@ -1,7 +1,7 @@
 import pino from 'pino';
 import type { Db } from '../db.js';
 import { listIssuesUpdatedSince, streamIssuesByCreated, listIssuesNewerThanNumber } from './githubIssues.js';
-import { getIssueSyncState, setIssueSyncState, upsertIssue, replaceIssueProducts } from './issueStore.js';
+import { findReusableEmbedding, getIssueSyncState, setIssueSyncState, upsertIssue, replaceIssueProducts } from './issueStore.js';
 import { extractPowertoysAreaProductLabels, extractPowertoysReportedVersion, normalizeAreaToProductLabel } from './powertoysTemplate.js';
 import type { IssueSyncRequest, GithubIssue } from './types.js';
 import { embedTextAzureOpenAI } from './embeddings.js';
@@ -70,6 +70,8 @@ export async function syncIssues(
   
   let processed = existingCount; // Start from existing count for accurate progress
   let embedded = 0;
+  const configuredEmbeddingModelId = process.env.ISSUE_EMBEDDING_MODEL_ID ?? '';
+  const embeddingReuseCache = new Map<string, { embeddingVectorLiteral: string; modelId: string }>();
 
   // Helper to process a single issue
   const processIssue = async (issue: GithubIssue) => {
@@ -78,7 +80,12 @@ export async function syncIssues(
     const templateVersion = extractPowertoysReportedVersion(issue.body ?? null);
     const targetVersion = templateVersion ?? milestoneVersion ?? null;
 
-    const { needsEmbedding } = await upsertIssue(db, { repoFullName, issue, targetVersion, milestoneTitle });
+    const { needsEmbedding, embeddingInputHash } = await upsertIssue(db, {
+      repoFullName,
+      issue,
+      targetVersion,
+      milestoneTitle,
+    });
 
     const productLabels = productLabelsFromGithubLabels(issue.labels);
     const templateProducts = extractPowertoysAreaProductLabels(issue.body ?? null);
@@ -92,21 +99,54 @@ export async function syncIssues(
 
     await replaceIssueProducts(db, { repoFullName, issueNumber: issue.number, productLabels: [...combined] });
 
-    if (issue.state === 'open' && needsEmbedding) {
+    if (needsEmbedding) {
       try {
-        const text = buildEmbeddingText(issue.title, issue.body ?? null);
-        const result = await embedTextAzureOpenAI(text);
-        await db.pool.query(
-          `
-          update issues
-          set embedding = $3::vector,
-              embedding_model = $4,
-              fetched_at = now()
-          where repo = $1 and issue_number = $2
-          `,
-          [repoFullName, issue.number, toVectorLiteral(result.embedding), result.model]
-        );
-        embedded++;
+        const cacheKey = `${configuredEmbeddingModelId}:${embeddingInputHash}`;
+        const cached = embeddingReuseCache.get(cacheKey) ??
+          (configuredEmbeddingModelId
+            ? await findReusableEmbedding(db, {
+                repoFullName,
+                issueNumber: issue.number,
+                embeddingInputHash,
+                modelId: configuredEmbeddingModelId,
+              })
+            : null);
+
+        if (cached) {
+          await db.pool.query(
+            `
+            update issues
+            set embedding = $3::vector,
+                embedding_model = $4,
+                embedding_input_hash = $5,
+                fetched_at = now()
+            where repo = $1 and issue_number = $2
+            `,
+            [repoFullName, issue.number, cached.embeddingVectorLiteral, cached.modelId, embeddingInputHash]
+          );
+          embeddingReuseCache.set(cacheKey, cached);
+          embedded++;
+        } else {
+          const text = buildEmbeddingText(issue.title, issue.body ?? null);
+          const result = await embedTextAzureOpenAI(text);
+          const embeddingVectorLiteral = toVectorLiteral(result.embedding);
+          await db.pool.query(
+            `
+            update issues
+            set embedding = $3::vector,
+                embedding_model = $4,
+                embedding_input_hash = $5,
+                fetched_at = now()
+            where repo = $1 and issue_number = $2
+            `,
+            [repoFullName, issue.number, embeddingVectorLiteral, result.model, embeddingInputHash]
+          );
+          embeddingReuseCache.set(cacheKey, {
+            embeddingVectorLiteral,
+            modelId: result.model,
+          });
+          embedded++;
+        }
       } catch (e) {
         logger.warn({ err: e, repoFullName, issueNumber: issue.number }, 'Embedding failed during sync');
       }

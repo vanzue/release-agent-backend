@@ -22,6 +22,13 @@ function contentHash(input: {
   return h.digest('hex');
 }
 
+function embeddingInputHash(input: { title: string; body: string | null }): string {
+  const cleanedBody = (input.body ?? '').trim();
+  const truncated = cleanedBody.length > 12000 ? cleanedBody.slice(0, 12000) : cleanedBody;
+  const text = `${input.title}\n\n${truncated}`.trim();
+  return createHash('sha256').update(text).digest('hex');
+}
+
 export async function getIssueSyncState(db: Db, repoFullName: string): Promise<{
   lastSyncedAt: string | null;
   lastSyncedIssueNumber: number | null;
@@ -81,7 +88,7 @@ export async function upsertIssue(
     targetVersion: string | null;
     milestoneTitle: string | null;
   }
-): Promise<{ needsEmbedding: boolean }> {
+): Promise<{ needsEmbedding: boolean; embeddingInputHash: string }> {
   const labels = (input.issue.labels ?? []).map((l) => l?.name).filter((x): x is string => Boolean(x));
   const body = input.issue.body ?? null;
 
@@ -96,6 +103,10 @@ export async function upsertIssue(
   const bodySnip = body ? body.slice(0, 500) : null;
   const reactionsTotal = input.issue.reactions?.total_count ?? 0;
   const issueType = extractIssueType(input.issue.labels);
+  const embedInputHash = embeddingInputHash({
+    title: input.issue.title,
+    body,
+  });
 
   const res = await db.pool.query(
     `
@@ -105,7 +116,7 @@ export async function upsertIssue(
       labels_json, milestone_title, target_version,
       state, created_at, updated_at, closed_at,
       comments_count, reactions_total_count,
-      content_hash, fetched_at, issue_type
+      content_hash, embedding_input_hash, fetched_at, issue_type
     )
     values (
       $1, $2, $3,
@@ -113,7 +124,7 @@ export async function upsertIssue(
       $7::jsonb, $8, $9,
       $10, $11::timestamptz, $12::timestamptz, $13::timestamptz,
       $14, $15,
-      $16, now(), $17
+      $16, $17, now(), $18
     )
     on conflict (repo, issue_number) do update set
       gh_id = excluded.gh_id,
@@ -130,11 +141,12 @@ export async function upsertIssue(
       comments_count = excluded.comments_count,
       reactions_total_count = excluded.reactions_total_count,
       content_hash = excluded.content_hash,
+      embedding_input_hash = excluded.embedding_input_hash,
       embedding = case when issues.content_hash <> excluded.content_hash then null else issues.embedding end,
       embedding_model = case when issues.content_hash <> excluded.content_hash then null else issues.embedding_model end,
       fetched_at = now(),
       issue_type = excluded.issue_type
-    returning embedding is null as needs_embedding
+    returning embedding is null as needs_embedding, embedding_input_hash
     `,
     [
       input.repoFullName,
@@ -153,10 +165,47 @@ export async function upsertIssue(
       input.issue.comments ?? 0,
       reactionsTotal,
       hash,
+      embedInputHash,
       issueType,
     ]
   );
-  return { needsEmbedding: Boolean(res.rows[0]?.needs_embedding) };
+  return {
+    needsEmbedding: Boolean(res.rows[0]?.needs_embedding),
+    embeddingInputHash: (res.rows[0]?.embedding_input_hash as string | undefined) ?? embedInputHash,
+  };
+}
+
+export async function findReusableEmbedding(
+  db: Db,
+  input: {
+    repoFullName: string;
+    issueNumber: number;
+    embeddingInputHash: string;
+    modelId: string;
+  }
+): Promise<{ embeddingVectorLiteral: string; modelId: string } | null> {
+  const res = await db.pool.query(
+    `
+    select embedding::text as embedding_vector_literal, embedding_model
+    from issues
+    where repo = $1
+      and issue_number <> $2
+      and embedding_input_hash = $3
+      and embedding_model = $4
+      and embedding is not null
+    order by updated_at desc
+    limit 1
+    `,
+    [input.repoFullName, input.issueNumber, input.embeddingInputHash, input.modelId]
+  );
+
+  const row = res.rows[0];
+  if (!row) return null;
+
+  return {
+    embeddingVectorLiteral: row.embedding_vector_literal as string,
+    modelId: row.embedding_model as string,
+  };
 }
 
 export async function replaceIssueProducts(

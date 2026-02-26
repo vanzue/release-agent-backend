@@ -61,7 +61,7 @@ const GITHUB_RETRY_CONFIG: Partial<RetryConfig> = {
   maxDelayMs: 120000,
 };
 
-async function githubRequest<T>(path: string, init?: RequestInit): Promise<T> {
+async function githubRequest<T>(path: string, init?: any): Promise<T> {
   const token = requireGithubToken();
   
   const response = await fetchWithRetry(

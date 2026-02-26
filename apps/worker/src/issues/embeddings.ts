@@ -20,7 +20,7 @@ export async function embedTextAzureOpenAI(text: string): Promise<{ model: strin
     ? `${baseURL}openai/deployments/${encodeURIComponent(modelId)}/embeddings?api-version=${encodeURIComponent(apiVersion)}`
     : `${baseURL}openai/v1/embeddings`;
 
-  const res = await fetch(url, {
+  const res: any = await fetch(url, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',

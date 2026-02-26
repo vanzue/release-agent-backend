@@ -494,6 +494,97 @@ export function createPgStore(db: Db) {
       };
     },
 
+    async resetIssueSyncData(input: {
+      repoFullName: string;
+      hardDeleteIssues?: boolean;
+    }): Promise<{
+      mode: 'soft' | 'hard';
+      clearedEmbeddings: number;
+      deletedIssueClusterMap: number;
+      deletedClusters: number;
+      deletedIssueProducts: number;
+      deletedIssues: number;
+      deletedSyncStateRows: number;
+    }> {
+      const repoFullName = input.repoFullName;
+      const hardDeleteIssues = Boolean(input.hardDeleteIssues);
+
+      await db.pool.query('begin');
+      try {
+        let clearedEmbeddings = 0;
+        let deletedIssueClusterMap = 0;
+        let deletedClusters = 0;
+        let deletedIssueProducts = 0;
+        let deletedIssues = 0;
+
+        const deleteMapRes = await db.pool.query('delete from issue_cluster_map where repo = $1', [repoFullName]);
+        deletedIssueClusterMap = deleteMapRes.rowCount ?? 0;
+
+        const deleteClustersRes = await db.pool.query('delete from clusters where repo = $1', [repoFullName]);
+        deletedClusters = deleteClustersRes.rowCount ?? 0;
+
+        if (hardDeleteIssues) {
+          const deleteProductsRes = await db.pool.query('delete from issue_products where repo = $1', [repoFullName]);
+          deletedIssueProducts = deleteProductsRes.rowCount ?? 0;
+
+          const deleteIssuesRes = await db.pool.query('delete from issues where repo = $1', [repoFullName]);
+          deletedIssues = deleteIssuesRes.rowCount ?? 0;
+        } else {
+          const hasEmbeddingInputHashRes = await db.pool.query(
+            `
+            select exists (
+              select 1
+              from information_schema.columns
+              where table_schema = 'public'
+                and table_name = 'issues'
+                and column_name = 'embedding_input_hash'
+            ) as has_col
+            `
+          );
+          const hasEmbeddingInputHash = Boolean(hasEmbeddingInputHashRes.rows[0]?.has_col);
+
+          const clearEmbeddingsSql = hasEmbeddingInputHash
+            ? `
+              update issues
+              set embedding = null,
+                  embedding_model = null,
+                  embedding_input_hash = null,
+                  fetched_at = now()
+              where repo = $1
+                and (embedding is not null or embedding_model is not null or embedding_input_hash is not null)
+            `
+            : `
+              update issues
+              set embedding = null,
+                  embedding_model = null,
+                  fetched_at = now()
+              where repo = $1
+                and (embedding is not null or embedding_model is not null)
+            `;
+
+          const clearEmbeddingsRes = await db.pool.query(clearEmbeddingsSql, [repoFullName]);
+          clearedEmbeddings = clearEmbeddingsRes.rowCount ?? 0;
+        }
+
+        const deleteSyncStateRes = await db.pool.query('delete from issue_sync_state where repo = $1', [repoFullName]);
+        const deletedSyncStateRows = deleteSyncStateRes.rowCount ?? 0;
+
+        await db.pool.query('commit');
+        return {
+          mode: hardDeleteIssues ? 'hard' : 'soft',
+          clearedEmbeddings,
+          deletedIssueClusterMap,
+          deletedClusters,
+          deletedIssueProducts,
+          deletedIssues,
+          deletedSyncStateRows,
+        };
+      } catch (error) {
+        await db.pool.query('rollback');
+        throw error;
+      }
+    },
+
     async findSimilarIssues(input: {
       repoFullName: string;
       issueNumber: number;

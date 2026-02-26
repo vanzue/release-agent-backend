@@ -279,7 +279,7 @@ export function isHttpRateLimitError(status: number, responseText: string): bool
 /**
  * Extract retry delay from HTTP response headers.
  */
-export function getRetryDelayFromHeaders(headers: Headers, maxDelayMs: number = 120000): number | null {
+export function getRetryDelayFromHeaders(headers: any, maxDelayMs: number = 120000): number | null {
   // Check Retry-After header (in seconds)
   const retryAfter = headers.get('retry-after');
   if (retryAfter) {
@@ -318,9 +318,9 @@ export interface FetchWithRetryOptions extends WithRetryOptions {
 
 export async function fetchWithRetry(
   url: string,
-  init?: RequestInit,
+  init?: any,
   options: FetchWithRetryOptions = {}
-): Promise<Response> {
+): Promise<any> {
   const isRetryable = options.isRetryable ?? isHttpRateLimitError;
   const config: RetryConfig = {
     ...DEFAULT_RETRY_CONFIG,
@@ -331,7 +331,7 @@ export async function fetchWithRetry(
   let lastError: Error | undefined;
 
   for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
-    const response = await fetch(url, init);
+    const response: any = await fetch(url, init);
 
     if (response.ok) {
       return response;

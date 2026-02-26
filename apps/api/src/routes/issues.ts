@@ -19,7 +19,7 @@ async function embedTextForSearch(text: string): Promise<number[]> {
     ? `${baseURL}openai/deployments/${encodeURIComponent(modelId)}/embeddings?api-version=${encodeURIComponent(apiVersion)}`
     : `${baseURL}openai/v1/embeddings`;
 
-  const res = await fetch(url, {
+  const res: any = await fetch(url, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -142,6 +142,39 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
 
     await enqueueIssueSync(body);
     return reply.code(202).send({ status: 'queued' });
+  });
+
+  server.post('/issues/sync-reset', async (req, reply) => {
+    const body = req.body as {
+      repoFullName?: string;
+      mode?: 'soft' | 'hard';
+      queueFullSync?: boolean;
+    };
+
+    if (!body?.repoFullName) {
+      return reply.code(400).send({ message: 'repoFullName is required' });
+    }
+
+    const mode = body.mode === 'hard' ? 'hard' : 'soft';
+    const reset = await store.resetIssueSyncData({
+      repoFullName: body.repoFullName,
+      hardDeleteIssues: mode === 'hard',
+    });
+
+    const shouldQueueFullSync = body.queueFullSync ?? true;
+    let queuedFullSync = false;
+    if (shouldQueueFullSync && enqueueIssueSync) {
+      await enqueueIssueSync({ repoFullName: body.repoFullName, fullSync: true });
+      queuedFullSync = true;
+    }
+
+    return reply.code(200).send({
+      status: 'ok',
+      mode,
+      queueAvailable: Boolean(enqueueIssueSync),
+      queuedFullSync,
+      reset,
+    });
   });
 
   server.post('/issues/recluster', async (req, reply) => {
