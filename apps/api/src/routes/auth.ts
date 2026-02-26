@@ -2,10 +2,11 @@ import type { FastifyInstance } from 'fastify';
 import type { CommunityAccessController, ViewerSource } from '../auth/communityAccess.js';
 
 function deriveApiOrigin(req: any): string {
+  const requestProtocol = typeof req.protocol === 'string' ? req.protocol.trim() : '';
   const rawProto =
     (typeof req.headers?.['x-forwarded-proto'] === 'string'
       ? req.headers['x-forwarded-proto']
-      : undefined) ?? 'https';
+      : undefined) ?? (requestProtocol || 'http');
   const rawHost =
     (typeof req.headers?.['x-forwarded-host'] === 'string'
       ? req.headers['x-forwarded-host']
