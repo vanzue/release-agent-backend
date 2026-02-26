@@ -70,9 +70,9 @@ jobs:
             -IssueAutoSyncIntervalMinutes 30 `
             -IssueEmbeddingModelId "${{ vars.ISSUE_EMBEDDING_MODEL_ID }}" `
             -CorsOrigin "${{ vars.CORS_ORIGIN }}" `
-            -GitHubOAuthClientId "${{ vars.GITHUB_OAUTH_CLIENT_ID }}" `
-            -GitHubOAuthClientSecret "${{ secrets.GITHUB_OAUTH_CLIENT_SECRET }}" `
-            -GitHubOAuthCallbackUrl "${{ vars.GITHUB_OAUTH_CALLBACK_URL }}" `
+            -GitHubOAuthClientId "${{ vars.OAUTH_CLIENT_ID }}" `
+            -GitHubOAuthClientSecret "${{ secrets.OAUTH_CLIENT_SECRET }}" `
+            -GitHubOAuthCallbackUrl "${{ vars.OAUTH_CALLBACK_URL }}" `
             -AuthFrontendBaseUrl "${{ vars.AUTH_FRONTEND_BASE_URL }}" `
             -AuthAppTokenSecret "${{ secrets.AUTH_APP_TOKEN_SECRET }}" `
             -LlmProvider "${{ vars.LLM_PROVIDER }}" `

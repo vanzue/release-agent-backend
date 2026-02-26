@@ -40,7 +40,8 @@ Notes:
   `ACCESS_CONTROL_ENABLED=true|false` (default `true`)
   `ACCESS_CONTROL_COMMUNITY_DOC_URL=https://raw.githubusercontent.com/microsoft/PowerToys/main/COMMUNITY.md`
   `ACCESS_CONTROL_EXTRA_LOGINS=comma,separated,github,logins`
-  `GITHUB_OAUTH_CLIENT_ID`
-  `GITHUB_OAUTH_CLIENT_SECRET`
+  GitHub Actions variable: `OAUTH_CLIENT_ID`
+  GitHub Actions secret: `OAUTH_CLIENT_SECRET`
+  GitHub Actions variable: `OAUTH_CALLBACK_URL`
   `AUTH_APP_TOKEN_SECRET`
   `AUTH_FRONTEND_BASE_URL`
