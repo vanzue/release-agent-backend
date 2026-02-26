@@ -560,19 +560,26 @@ export function createPgStore(db: Db) {
       const issuesPerSemantic = Math.min(Math.max(input.issuesPerSemantic ?? 8, 2), 20);
       const minSimilarity = input.minSimilarity ?? 0.84;
 
-      const releaseRes = await db.pool.query(
-        `
-        select
-          latest_release_tag,
-          latest_release_name,
-          latest_release_url,
-          latest_release_version,
-          latest_release_published_at
-        from repo_release_state
-        where repo = $1
-        `,
-        [input.repoFullName]
+      const hasReleaseStateTableRes = await db.pool.query(
+        `select to_regclass('public.repo_release_state') is not null as exists`
       );
+      const hasReleaseStateTable = Boolean(hasReleaseStateTableRes.rows[0]?.exists);
+
+      const releaseRes = hasReleaseStateTable
+        ? await db.pool.query(
+            `
+            select
+              latest_release_tag,
+              latest_release_name,
+              latest_release_url,
+              latest_release_version,
+              latest_release_published_at
+            from repo_release_state
+            where repo = $1
+            `,
+            [input.repoFullName]
+          )
+        : { rows: [] as any[] };
       const releaseRow = releaseRes.rows[0];
 
       let source: 'github_release' | 'issues_fallback' | 'none' = 'none';
