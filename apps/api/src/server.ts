@@ -2,12 +2,15 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerDocsRoutes } from './routes/docs.js';
+import { registerAuthRoutes } from './routes/auth.js';
 import { registerSessionRoutes } from './routes/sessions.js';
 import { registerIssueRoutes } from './routes/issues.js';
 import { createDb } from './db.js';
 import { createPgStore } from './store/pg.js';
+import { createCommunityAccessController } from './auth/communityAccess.js';
 
 export async function buildServer(): Promise<FastifyInstance> {
+  const accessControl = createCommunityAccessController();
   const server = Fastify({
     logger: {
       level: process.env.LOG_LEVEL ?? 'info',
@@ -33,6 +36,26 @@ export async function buildServer(): Promise<FastifyInstance> {
   await server.register(cors, {
     origin: process.env.CORS_ORIGIN?.split(',') ?? true,
     credentials: true,
+    allowedHeaders: ['Authorization', 'Content-Type', 'Accept'],
+  });
+
+  server.addHook('onRequest', async (request, reply) => {
+    const decision = await accessControl.authorize({
+      method: request.method,
+      url: request.url,
+      authorizationHeader: request.headers.authorization,
+    });
+
+    if (!decision.allowed) {
+      return reply.code(decision.statusCode).send({ message: decision.message });
+    }
+
+    if (decision.login) {
+      (request as any).viewer = {
+        login: decision.login,
+        source: decision.source,
+      };
+    }
   });
 
   const db = createDb();
@@ -43,6 +66,7 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   registerHealthRoutes(server);
   await registerDocsRoutes(server);
+  registerAuthRoutes(server);
   registerSessionRoutes(server, store);
   registerIssueRoutes(server, store);
 

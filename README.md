@@ -34,3 +34,9 @@ Copy env files:
 Notes:
 
 - The API uses PostgreSQL (`DATABASE_URL`) for releases/sessions/jobs/artifacts.
+- API access control now validates GitHub bearer tokens against PowerToys `COMMUNITY.md`.
+  Public paths: `/healthz`, `/docs/*`, `/openapi.yaml`.
+  Config (optional):
+  `ACCESS_CONTROL_ENABLED=true|false` (default `true`)
+  `ACCESS_CONTROL_COMMUNITY_DOC_URL=https://raw.githubusercontent.com/microsoft/PowerToys/main/COMMUNITY.md`
+  `ACCESS_CONTROL_EXTRA_LOGINS=comma,separated,github,logins`
