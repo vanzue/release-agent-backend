@@ -26,12 +26,58 @@ function extractTemplateField(body: string, heading: string): string | null {
   return text;
 }
 
+function stripLeadingZeros(input: string): string {
+  const stripped = input.replace(/^0+/, '');
+  return stripped.length > 0 ? stripped : '0';
+}
+
+// Normalize user-entered PowerToys versions into canonical form:
+// - Accept canonical 0.x or 0.x.y
+// - Accept shorthand x.y (treated as 0.x.y) when x is in a plausible PowerToys range
+// - Reject obvious non-PowerToys values (e.g. Windows build numbers)
+export function normalizePowertoysVersion(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const text = raw.trim();
+  if (!text) return null;
+
+  const match = text.match(/(\d+)\.(\d+)(?:\.(\d+))?/);
+  if (!match) return null;
+
+  const aRaw = match[1];
+  const bRaw = match[2];
+  const cRaw = match[3] ?? null;
+
+  const a = Number.parseInt(aRaw, 10);
+  const b = Number.parseInt(bRaw, 10);
+  const c = cRaw === null ? null : Number.parseInt(cRaw, 10);
+
+  if (!Number.isFinite(a) || !Number.isFinite(b) || (c !== null && !Number.isFinite(c))) return null;
+
+  // Canonical PowerToys format: 0.x(.y)
+  if (a === 0) {
+    if (b > 299 || (c !== null && c > 99)) return null;
+    return c === null ? `0.${b}` : `0.${b}.${c}`;
+  }
+
+  // Shorthand entries like "90.1" => "0.90.1"
+  // Keep this conservative to avoid converting unrelated versions/builds.
+  if (c === null && a >= 20 && a <= 299 && b <= 99) {
+    return `0.${stripLeadingZeros(aRaw)}.${stripLeadingZeros(bRaw)}`;
+  }
+
+  // Variants like "095.1.0" => "0.95.1"
+  if (c !== null && a >= 20 && a <= 299 && b <= 99 && c <= 99) {
+    return `0.${stripLeadingZeros(aRaw)}.${stripLeadingZeros(bRaw)}`;
+  }
+
+  return null;
+}
+
 export function extractPowertoysReportedVersion(body: string | null): string | null {
   if (!body) return null;
   const v = extractTemplateField(body, 'Microsoft PowerToys version');
   if (!v) return null;
-  const m = v.match(/(\d+\.\d+(?:\.\d+)?)/);
-  return m?.[1] ?? null;
+  return normalizePowertoysVersion(v);
 }
 
 function toPascalLike(input: string): string {

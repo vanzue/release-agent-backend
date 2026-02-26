@@ -2,7 +2,12 @@ import pino from 'pino';
 import type { Db } from '../db.js';
 import { getLatestRelease, listIssuesUpdatedSince, streamIssuesByCreated, listIssuesNewerThanNumber } from './githubIssues.js';
 import { findReusableEmbedding, getIssueSyncState, setIssueSyncState, upsertIssue, replaceIssueProducts, upsertRepoLatestRelease } from './issueStore.js';
-import { extractPowertoysAreaProductLabels, extractPowertoysReportedVersion, normalizeAreaToProductLabel } from './powertoysTemplate.js';
+import {
+  extractPowertoysAreaProductLabels,
+  extractPowertoysReportedVersion,
+  normalizeAreaToProductLabel,
+  normalizePowertoysVersion,
+} from './powertoysTemplate.js';
 import type { IssueSyncRequest, GithubIssue } from './types.js';
 import { embedTextAzureOpenAI } from './embeddings.js';
 import { toVectorLiteral } from './vector.js';
@@ -11,8 +16,7 @@ const logger = pino({ name: 'issue-sync', level: process.env.LOG_LEVEL ?? 'info'
 
 function extractVersionFromMilestoneTitle(title: string | null): string | null {
   if (!title) return null;
-  const m = title.match(/(\d+\.\d+(?:\.\d+)?)/);
-  return m?.[1] ?? null;
+  return normalizePowertoysVersion(title);
 }
 
 function productLabelsFromGithubLabels(labels: Array<{ name?: string }> | null | undefined): string[] {
@@ -42,14 +46,6 @@ function buildEmbeddingText(title: string, body: string | null): string {
   return `${title}\n\n${truncated}`.trim();
 }
 
-function extractVersionFromText(value: string | null | undefined): string | null {
-  if (!value) return null;
-  const match = value.match(/(\d+)\.(\d+)(?:\.(\d+))?/);
-  if (!match) return null;
-  const patch = match[3];
-  return patch ? `${match[1]}.${match[2]}.${patch}` : `${match[1]}.${match[2]}`;
-}
-
 export async function syncIssues(
   db: Db,
   request: IssueSyncRequest,
@@ -71,7 +67,7 @@ export async function syncIssues(
       tag: latestRelease?.tag_name ?? null,
       name: latestRelease?.name ?? null,
       url: latestRelease?.html_url ?? null,
-      version: extractVersionFromText(latestRelease?.tag_name) ?? extractVersionFromText(latestRelease?.name) ?? null,
+      version: normalizePowertoysVersion(latestRelease?.tag_name) ?? normalizePowertoysVersion(latestRelease?.name) ?? null,
       publishedAt: latestRelease?.published_at ?? null,
     });
   } catch (e) {

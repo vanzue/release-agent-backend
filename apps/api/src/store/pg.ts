@@ -70,11 +70,16 @@ function parseVersionTuple(version: string | null | undefined): [number, number,
   if (!version) return null;
   const match = version.match(/^(\d+)\.(\d+)(?:\.(\d+))?$/);
   if (!match) return null;
-  return [
-    Number.parseInt(match[1], 10),
-    Number.parseInt(match[2], 10),
-    Number.parseInt(match[3] ?? '0', 10),
-  ];
+  const major = Number.parseInt(match[1], 10);
+  const minor = Number.parseInt(match[2], 10);
+  const patch = Number.parseInt(match[3] ?? '0', 10);
+
+  if (!Number.isFinite(major) || !Number.isFinite(minor) || !Number.isFinite(patch)) return null;
+  if (major !== 0) return null;
+  if (minor < 0 || minor > 299) return null;
+  if (patch < 0 || patch > 99) return null;
+
+  return [major, minor, patch];
 }
 
 function compareVersionTuple(a: [number, number, number], b: [number, number, number]): number {
@@ -127,6 +132,10 @@ function pickPrimaryProductLabel(issues: Array<{ productLabels: string[] }>): st
     }
   }
   return bestLabel;
+}
+
+function isCanonicalPowertoysVersion(version: string | null | undefined): boolean {
+  return parseVersionTuple(version) !== null;
 }
 
 export function createPgStore(db: Db) {
@@ -257,7 +266,9 @@ export function createPgStore(db: Db) {
         `
         select target_version, count(*)::int as issue_count
         from issues
-        where repo = $1 and state = 'open'
+        where repo = $1
+          and state = 'open'
+          and (target_version is null or target_version ~ '^0\\.(?:[0-9]|[1-9][0-9]|[1-2][0-9]{2})(?:\\.[0-9]{1,2})?$')
         group by target_version
         order by
           -- Sort by numeric version parts: major.minor.patch
@@ -287,6 +298,7 @@ export function createPgStore(db: Db) {
           join issues i on i.repo = p.repo and i.issue_number = p.issue_number
           where i.repo = $1
             and i.state = 'open'
+            and (i.target_version is null or i.target_version ~ '^0\\.(?:[0-9]|[1-9][0-9]|[1-2][0-9]{2})(?:\\.[0-9]{1,2})?$')
             and ($2::boolean = false or i.target_version is not distinct from $3)
           group by p.product_label
         )
@@ -584,21 +596,35 @@ export function createPgStore(db: Db) {
 
       let source: 'github_release' | 'issues_fallback' | 'none' = 'none';
       let latestVersion = (releaseRow?.latest_release_version as string | null | undefined) ?? null;
-      if (latestVersion) {
+      if (latestVersion && isCanonicalPowertoysVersion(latestVersion)) {
         source = 'github_release';
+      } else {
+        latestVersion = null;
       }
 
       if (!latestVersion) {
         const versionRes = await db.pool.query(
           `
-          select target_version
+          select target_version, count(*)::int as issue_count
           from issues
-          where repo = $1 and target_version is not null
+          where repo = $1
+            and target_version is not null
+            and target_version ~ '^0\\.(?:[0-9]|[1-9][0-9]|[1-2][0-9]{2})(?:\\.[0-9]{1,2})?$'
           group by target_version
           `,
           [input.repoFullName]
         );
-        latestVersion = latestVersionFromList(versionRes.rows.map((r: any) => r.target_version as string | null));
+        const versionRows = versionRes.rows.map((r: any) => ({
+          targetVersion: r.target_version as string | null,
+          issueCount: Number(r.issue_count ?? 0),
+        }));
+
+        const stableCandidates = versionRows.filter((v) => v.issueCount >= 5).map((v) => v.targetVersion);
+        const fallbackCandidates = stableCandidates.length > 0
+          ? stableCandidates
+          : versionRows.map((v) => v.targetVersion);
+
+        latestVersion = latestVersionFromList(fallbackCandidates);
         if (latestVersion) source = 'issues_fallback';
       }
 
@@ -1122,6 +1148,7 @@ export function createPgStore(db: Db) {
         ${productJoin}
         where i.repo = $1
           and i.state = 'open'
+          and (i.target_version is null or i.target_version ~ '^0\\.(?:[0-9]|[1-9][0-9]|[1-2][0-9]{2})(?:\\.[0-9]{1,2})?$')
           and ($2::boolean = false or i.target_version is not distinct from $3)
           ${productFilter}
         order by i.reactions_total_count desc, i.comments_count desc, i.updated_at desc
