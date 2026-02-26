@@ -324,16 +324,21 @@ export function createPgStore(db: Db) {
     async listIssueClusters(input: {
       repoFullName: string;
       productLabel: string;
-    }): Promise<
-      Array<{
+      limit?: number;
+    }): Promise<{
+      clusters: Array<{
         clusterId: string;
         size: number;
         updatedAt: string;
         popularity: number;
         representativeIssueNumber: number | null;
         representativeTitle: string | null;
-      }>
-    > {
+      }>;
+      isTruncated: boolean;
+      limit: number;
+    }> {
+      const requestedLimit = typeof input.limit === 'number' && Number.isFinite(input.limit) ? input.limit : 100;
+      const limit = Math.min(Math.max(Math.trunc(requestedLimit), 10), 300);
       const res = await db.pool.query(
         `
         select
@@ -348,17 +353,24 @@ export function createPgStore(db: Db) {
         where c.repo = $1
           and c.product_label = $2
         order by c.popularity desc, c.size desc, c.updated_at desc
+        limit $3
         `,
-        [input.repoFullName, input.productLabel]
+        [input.repoFullName, input.productLabel, limit + 1]
       );
-      return res.rows.map((r: any) => ({
-        clusterId: r.cluster_id as string,
-        size: Number(r.size ?? 0),
-        updatedAt: r.updated_at as string,
-        popularity: Number(r.popularity ?? 0),
-        representativeIssueNumber: (r.representative_issue_number as number | null) ?? null,
-        representativeTitle: (r.representative_title as string | null) ?? null,
-      }));
+      const isTruncated = res.rows.length > limit;
+      const rows = isTruncated ? res.rows.slice(0, limit) : res.rows;
+      return {
+        clusters: rows.map((r: any) => ({
+          clusterId: r.cluster_id as string,
+          size: Number(r.size ?? 0),
+          updatedAt: r.updated_at as string,
+          popularity: Number(r.popularity ?? 0),
+          representativeIssueNumber: (r.representative_issue_number as number | null) ?? null,
+          representativeTitle: (r.representative_title as string | null) ?? null,
+        })),
+        isTruncated,
+        limit,
+      };
     },
 
     async getIssueCluster(input: {

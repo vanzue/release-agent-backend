@@ -111,16 +111,26 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
   });
 
   server.get('/issues/clusters', async (req) => {
-    const { repo, productLabel } = req.query as { repo: string; productLabel: string };
+    const { repo, productLabel, limit } = req.query as { repo: string; productLabel: string; limit?: string };
     const versions = await store.listIssueVersions(repo);
     const defaultTargetVersion = pickLatestVersion(versions.map((v) => v.targetVersion));
 
-    const clusters = await store.listIssueClusters({
+    const parsedLimit = limit ? Number.parseInt(limit, 10) : undefined;
+
+    const clusterResult = await store.listIssueClusters({
       repoFullName: repo,
       productLabel,
+      limit: Number.isFinite(parsedLimit as number) ? parsedLimit : undefined,
     });
 
-    return { targetVersion: null, defaultTargetVersion, productLabel, clusters };
+    return {
+      targetVersion: null,
+      defaultTargetVersion,
+      productLabel,
+      clusters: clusterResult.clusters,
+      isTruncated: clusterResult.isTruncated,
+      limit: clusterResult.limit,
+    };
   });
 
   server.get('/issues/clusters/:clusterId', async (req, reply) => {
