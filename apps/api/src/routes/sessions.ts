@@ -208,8 +208,8 @@ export function registerSessionRoutes(server: FastifyInstance, store: PgStore) {
 
   server.delete('/sessions/:sessionId', async (req, reply) => {
     const { sessionId } = req.params as { sessionId: string };
-    const deleted = await store.deleteSession(sessionId);
-    if (!deleted) return reply.code(404).send({ message: 'Session not found' });
+    // Idempotent delete: return 204 even when the session no longer exists.
+    await store.deleteSession(sessionId);
     return reply.code(204).send();
   });
 
