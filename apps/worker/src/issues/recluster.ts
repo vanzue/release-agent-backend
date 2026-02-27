@@ -32,6 +32,7 @@ export async function reclusterBucket(db: Db, req: IssueReclusterRequest): Promi
   const productLabel = req.productLabel;
   const threshold = req.threshold;
   const topK = req.topK;
+  const embeddingModel = process.env.ISSUE_EMBEDDING_MODEL_ID?.trim() || null;
 
   logger.info({ repoFullName, productLabel, threshold, topK }, 'Reclustering bucket');
 
@@ -58,16 +59,49 @@ export async function reclusterBucket(db: Db, req: IssueReclusterRequest): Promi
     where i.repo = $1
       and i.state = 'open'
       and i.embedding is not null
+      and ($3::text is null or i.embedding_model = $3)
       and p.product_label = $2
     order by i.issue_number asc
     `,
-    [repoFullName, productLabel]
+    [repoFullName, productLabel, embeddingModel]
   );
 
-  let mapped = 0;
-  for (const row of issuesRes.rows) {
-    const issueNumber = row.issue_number as number;
+  const parsedRows = issuesRes.rows.map((row) => {
     const embedding = parseVector(row.embedding);
+    return {
+      row,
+      embedding,
+      dim: embedding.length,
+    };
+  });
+
+  const dimCounts = new Map<number, number>();
+  for (const item of parsedRows) {
+    dimCounts.set(item.dim, (dimCounts.get(item.dim) ?? 0) + 1);
+  }
+
+  let dominantDim: number | null = null;
+  let dominantCount = -1;
+  for (const [dim, count] of dimCounts.entries()) {
+    if (count > dominantCount) {
+      dominantDim = dim;
+      dominantCount = count;
+    }
+  }
+
+  const filteredRows = dominantDim === null
+    ? parsedRows
+    : parsedRows.filter((item) => item.dim === dominantDim);
+  const skippedDifferentDim = parsedRows.length - filteredRows.length;
+  if (skippedDifferentDim > 0) {
+    logger.warn({ repoFullName, productLabel, dominantDim, skippedDifferentDim }, 'Skipping embeddings with non-dominant dimensions');
+  }
+
+  let mapped = 0;
+  for (const item of filteredRows) {
+    const row = item.row;
+    const issueNumber = row.issue_number as number;
+    const embedding = item.embedding;
     const embeddingLit = toVectorLiteral(embedding);
     const popularity = issuePopularity({
       comments: Number(row.comments_count ?? 0),

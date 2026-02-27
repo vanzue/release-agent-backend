@@ -273,6 +273,7 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
       semanticLimit: semanticLimit ? Number.parseInt(semanticLimit, 10) : undefined,
       issuesPerSemantic: issuesPerSemantic ? Number.parseInt(issuesPerSemantic, 10) : undefined,
       minSimilarity: minSimilarity ? Number.parseFloat(minSimilarity) : undefined,
+      embeddingModel: process.env.ISSUE_EMBEDDING_MODEL_ID?.trim() || undefined,
     });
 
     return dashboard;
@@ -426,6 +427,7 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
         const results = await store.searchIssuesByEmbedding({
           repoFullName: repo,
           embedding,
+          embeddingModel: process.env.ISSUE_EMBEDDING_MODEL_ID?.trim() || undefined,
           productLabel: normalizedProductLabel,
           minSimilarity: minSim,
           limit: limitNum,

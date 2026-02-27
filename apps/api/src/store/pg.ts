@@ -539,6 +539,7 @@ export function createPgStore(db: Db) {
       semanticLimit?: number;
       issuesPerSemantic?: number;
       minSimilarity?: number;
+      embeddingModel?: string;
     }): Promise<{
       latestRelease: {
         tag: string | null;
@@ -583,6 +584,7 @@ export function createPgStore(db: Db) {
       const semanticLimit = Math.min(Math.max(input.semanticLimit ?? 6, 1), 12);
       const issuesPerSemantic = Math.min(Math.max(input.issuesPerSemantic ?? 8, 2), 20);
       const minSimilarity = input.minSimilarity ?? 0.84;
+      const embeddingModel = input.embeddingModel?.trim() || null;
 
       const hasReleaseStateTableRes = await db.pool.query(
         `select to_regclass('public.repo_release_state') is not null as exists`
@@ -679,6 +681,7 @@ export function createPgStore(db: Db) {
         where i.repo = $1
           and i.target_version = any($2::text[])
           and i.embedding is not null
+          and ($4::text is null or i.embedding_model = $4)
         group by
           i.issue_number,
           i.title,
@@ -692,7 +695,7 @@ export function createPgStore(db: Db) {
           i.updated_at desc
         limit $3
         `,
-        [input.repoFullName, versionCandidates, anchorScanLimit]
+        [input.repoFullName, versionCandidates, anchorScanLimit, embeddingModel]
       );
 
       const anchorRows = anchorsRes.rows.map((r: any) => ({
@@ -736,9 +739,12 @@ export function createPgStore(db: Db) {
         const similarRes = await db.pool.query(
           `
           with anchor_issue as (
-            select embedding
+            select embedding, embedding_model
             from issues
-            where repo = $1 and issue_number = $2 and embedding is not null
+            where repo = $1
+              and issue_number = $2
+              and embedding is not null
+              and ($8::text is null or embedding_model = $8)
           )
           select
             i.issue_number,
@@ -756,6 +762,8 @@ export function createPgStore(db: Db) {
             and i.issue_number <> $2
             and i.target_version = any($3::text[])
             and i.embedding is not null
+            and i.embedding_model is not distinct from a.embedding_model
+            and vector_dims(i.embedding) = vector_dims(a.embedding)
             and 1 - (i.embedding <=> a.embedding) >= $4
             and (
               $5::boolean = false
@@ -787,6 +795,7 @@ export function createPgStore(db: Db) {
             requireOverlap,
             overlapProducts,
             issuesPerSemantic - 1,
+            embeddingModel,
           ]
         );
 
@@ -1013,9 +1022,12 @@ export function createPgStore(db: Db) {
 
       const sql = `
         with target as (
-          select embedding
+          select embedding, embedding_model
           from issues
-          where repo = $1 and issue_number = $2 and embedding is not null
+          where repo = $1
+            and issue_number = $2
+            and embedding is not null
+            and embedding_model is not null
         )
         select
           i.issue_number,
@@ -1030,8 +1042,10 @@ export function createPgStore(db: Db) {
         where i.repo = $1
           and i.issue_number <> $2
           and i.embedding is not null
+          and i.embedding_model is not distinct from t.embedding_model
+          and vector_dims(i.embedding) = vector_dims(t.embedding)
           and 1 - (i.embedding <=> t.embedding) >= $3
-        group by i.issue_number, i.title, i.state, i.updated_at, i.embedding, t.embedding
+        group by i.issue_number, i.title, i.state, i.updated_at, i.embedding, t.embedding, t.embedding_model
         ${productFilter}
         order by similarity desc
         limit $4
@@ -1058,6 +1072,7 @@ export function createPgStore(db: Db) {
     async searchIssuesByEmbedding(input: {
       repoFullName: string;
       embedding: number[];
+      embeddingModel?: string;
       productLabel?: string;
       minSimilarity?: number; // default 0.85
       limit?: number; // default 20
@@ -1077,7 +1092,7 @@ export function createPgStore(db: Db) {
       // Convert embedding array to pgvector literal format
       const embeddingLiteral = `[${input.embedding.map((v) => (Number.isFinite(v) ? v : 0)).join(',')}]`;
 
-      const params: any[] = [input.repoFullName, embeddingLiteral, minSim];
+      const params: any[] = [input.repoFullName, embeddingLiteral, minSim, input.embeddingModel?.trim() || null];
       
       let productFilter = '';
       if (input.productLabel) {
@@ -1097,6 +1112,8 @@ export function createPgStore(db: Db) {
         left join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
         where i.repo = $1
           and i.embedding is not null
+          and vector_dims(i.embedding) = vector_dims($2::vector)
+          and ($4::text is null or i.embedding_model = $4)
           and 1 - (i.embedding <=> $2::vector) >= $3
         group by i.issue_number, i.title, i.state, i.updated_at, i.embedding
         ${productFilter}

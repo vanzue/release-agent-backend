@@ -103,6 +103,7 @@ export async function syncIssues(
       issue,
       targetVersion,
       milestoneTitle,
+      expectedEmbeddingModel: configuredEmbeddingModelId || null,
     });
 
     const productLabels = productLabelsFromGithubLabels(issue.labels);

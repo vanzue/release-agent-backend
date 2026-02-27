@@ -129,6 +129,7 @@ export async function upsertIssue(
     issue: GithubIssue;
     targetVersion: string | null;
     milestoneTitle: string | null;
+    expectedEmbeddingModel?: string | null;
   }
 ): Promise<{ needsEmbedding: boolean; embeddingInputHash: string }> {
   const labels = (input.issue.labels ?? []).map((l) => l?.name).filter((x): x is string => Boolean(x));
@@ -145,6 +146,7 @@ export async function upsertIssue(
   const bodySnip = body ? body.slice(0, 500) : null;
   const reactionsTotal = input.issue.reactions?.total_count ?? 0;
   const issueType = extractIssueType(input.issue.labels);
+  const expectedEmbeddingModel = input.expectedEmbeddingModel?.trim() || null;
   const embedInputHash = embeddingInputHash({
     title: input.issue.title,
     body,
@@ -184,8 +186,18 @@ export async function upsertIssue(
       reactions_total_count = excluded.reactions_total_count,
       content_hash = excluded.content_hash,
       embedding_input_hash = excluded.embedding_input_hash,
-      embedding = case when issues.content_hash <> excluded.content_hash then null else issues.embedding end,
-      embedding_model = case when issues.content_hash <> excluded.content_hash then null else issues.embedding_model end,
+      embedding = case
+        when issues.content_hash <> excluded.content_hash
+          or ($19::text is not null and issues.embedding_model is distinct from $19)
+        then null
+        else issues.embedding
+      end,
+      embedding_model = case
+        when issues.content_hash <> excluded.content_hash
+          or ($19::text is not null and issues.embedding_model is distinct from $19)
+        then null
+        else issues.embedding_model
+      end,
       fetched_at = now(),
       issue_type = excluded.issue_type
     returning embedding is null as needs_embedding, embedding_input_hash
@@ -209,6 +221,7 @@ export async function upsertIssue(
       hash,
       embedInputHash,
       issueType,
+      expectedEmbeddingModel,
     ]
   );
   return {
