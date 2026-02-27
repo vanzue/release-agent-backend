@@ -453,7 +453,7 @@ export function createPgStore(db: Db) {
 
     async searchIssues(input: {
       repoFullName: string;
-      targetVersion: string | null;
+      targetVersion: string | null | undefined;
       productLabels?: string[];
       state?: 'open' | 'closed';
       clusterId?: string;
@@ -532,6 +532,194 @@ export function createPgStore(db: Db) {
         productLabels: (r.product_labels as string[] | null) ?? [],
         updatedAt: r.updated_at as string,
       }));
+    },
+
+    async getIssueDetail(input: {
+      repoFullName: string;
+      issueNumber: number;
+      minSimilarity?: number;
+      limit?: number;
+    }): Promise<{
+      issue: {
+        issueNumber: number;
+        ghId: string;
+        title: string;
+        body: string | null;
+        bodySnip: string | null;
+        labelsJson: any;
+        milestoneTitle: string | null;
+        targetVersion: string | null;
+        state: 'open' | 'closed';
+        createdAt: string;
+        updatedAt: string;
+        closedAt: string | null;
+        commentsCount: number;
+        reactionsCount: number;
+        embeddingModel: string | null;
+        productLabels: string[];
+      };
+      clusterMemberships: Array<{
+        clusterId: string;
+        targetVersion: string | null;
+        productLabel: string;
+        similarity: number;
+        assignedAt: string;
+        clusterSize: number;
+        clusterPopularity: number;
+        representativeIssueNumber: number | null;
+        clusterUpdatedAt: string | null;
+      }>;
+      similarIssues: Array<{
+        issueNumber: number;
+        title: string;
+        state: 'open' | 'closed';
+        similarity: number;
+        productLabels: string[];
+        updatedAt: string;
+      }>;
+    } | null> {
+      const issueRes = await db.pool.query(
+        `
+        select
+          i.issue_number,
+          i.gh_id,
+          i.title,
+          i.body,
+          i.body_snip,
+          i.labels_json,
+          i.milestone_title,
+          i.target_version,
+          i.state,
+          i.created_at,
+          i.updated_at,
+          i.closed_at,
+          i.comments_count,
+          i.reactions_total_count,
+          i.embedding_model,
+          coalesce(
+            array_agg(distinct p.product_label) filter (where p.product_label is not null),
+            '{}'
+          ) as product_labels
+        from issues i
+        left join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
+        where i.repo = $1 and i.issue_number = $2
+        group by
+          i.issue_number,
+          i.gh_id,
+          i.title,
+          i.body,
+          i.body_snip,
+          i.labels_json,
+          i.milestone_title,
+          i.target_version,
+          i.state,
+          i.created_at,
+          i.updated_at,
+          i.closed_at,
+          i.comments_count,
+          i.reactions_total_count,
+          i.embedding_model
+        `,
+        [input.repoFullName, input.issueNumber]
+      );
+
+      const issueRow = issueRes.rows[0];
+      if (!issueRow) return null;
+
+      const clusterRes = await db.pool.query(
+        `
+        select
+          m.cluster_id,
+          m.target_version,
+          m.product_label,
+          m.similarity,
+          m.assigned_at,
+          c.size as cluster_size,
+          c.popularity as cluster_popularity,
+          c.representative_issue_number,
+          c.updated_at as cluster_updated_at
+        from issue_cluster_map m
+        left join clusters c on c.cluster_id = m.cluster_id
+        where m.repo = $1 and m.issue_number = $2
+        order by m.similarity desc, m.assigned_at desc
+        `,
+        [input.repoFullName, input.issueNumber]
+      );
+
+      const minSim = input.minSimilarity ?? 0.84;
+      const limit = Math.min(input.limit ?? 20, 100);
+      const similarRes = await db.pool.query(
+        `
+        with target as (
+          select embedding, embedding_model
+          from issues
+          where repo = $1
+            and issue_number = $2
+            and embedding is not null
+            and embedding_model is not null
+        )
+        select
+          i.issue_number,
+          i.title,
+          i.state,
+          i.updated_at,
+          1 - (i.embedding <=> t.embedding) as similarity,
+          coalesce(array_agg(distinct p.product_label) filter (where p.product_label is not null), '{}') as product_labels
+        from issues i
+        cross join target t
+        left join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
+        where i.repo = $1
+          and i.issue_number <> $2
+          and i.embedding is not null
+          and i.embedding_model is not distinct from t.embedding_model
+          and vector_dims(i.embedding) = vector_dims(t.embedding)
+          and 1 - (i.embedding <=> t.embedding) >= $3
+        group by i.issue_number, i.title, i.state, i.updated_at, i.embedding, t.embedding, t.embedding_model
+        order by similarity desc
+        limit $4
+        `,
+        [input.repoFullName, input.issueNumber, minSim, limit]
+      );
+
+      return {
+        issue: {
+          issueNumber: Number(issueRow.issue_number),
+          ghId: String(issueRow.gh_id),
+          title: issueRow.title as string,
+          body: (issueRow.body as string | null) ?? null,
+          bodySnip: (issueRow.body_snip as string | null) ?? null,
+          labelsJson: issueRow.labels_json,
+          milestoneTitle: (issueRow.milestone_title as string | null) ?? null,
+          targetVersion: (issueRow.target_version as string | null) ?? null,
+          state: issueRow.state as 'open' | 'closed',
+          createdAt: issueRow.created_at as string,
+          updatedAt: issueRow.updated_at as string,
+          closedAt: (issueRow.closed_at as string | null) ?? null,
+          commentsCount: Number(issueRow.comments_count ?? 0),
+          reactionsCount: Number(issueRow.reactions_total_count ?? 0),
+          embeddingModel: (issueRow.embedding_model as string | null) ?? null,
+          productLabels: (issueRow.product_labels as string[] | null) ?? [],
+        },
+        clusterMemberships: clusterRes.rows.map((r: any) => ({
+          clusterId: r.cluster_id as string,
+          targetVersion: (r.target_version as string | null) ?? null,
+          productLabel: r.product_label as string,
+          similarity: Number(r.similarity ?? 0),
+          assignedAt: r.assigned_at as string,
+          clusterSize: Number(r.cluster_size ?? 0),
+          clusterPopularity: Number(r.cluster_popularity ?? 0),
+          representativeIssueNumber: (r.representative_issue_number as number | null) ?? null,
+          clusterUpdatedAt: (r.cluster_updated_at as string | null) ?? null,
+        })),
+        similarIssues: similarRes.rows.map((r: any) => ({
+          issueNumber: Number(r.issue_number),
+          title: r.title as string,
+          state: r.state as 'open' | 'closed',
+          similarity: Number(r.similarity ?? 0),
+          productLabels: (r.product_labels as string[] | null) ?? [],
+          updatedAt: r.updated_at as string,
+        })),
+      };
     },
 
     async getIssueDashboard(input: {

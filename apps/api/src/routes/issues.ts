@@ -221,7 +221,16 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
 
     const versions = await store.listIssueVersions(query.repo);
     const defaultTargetVersion = pickLatestVersion(versions.map((v) => v.targetVersion));
-    const resolvedTargetVersion = query.targetVersion ?? defaultTargetVersion;
+    let resolvedTargetVersion: string | null | undefined;
+    if (query.targetVersion === undefined) {
+      resolvedTargetVersion = defaultTargetVersion;
+    } else if (query.targetVersion === '__all__') {
+      resolvedTargetVersion = undefined;
+    } else if (query.targetVersion === '__null__') {
+      resolvedTargetVersion = null;
+    } else {
+      resolvedTargetVersion = query.targetVersion;
+    }
 
     const productLabels = query.productLabels
       ? query.productLabels.split(',').map((s) => s.trim()).filter(Boolean)
@@ -232,7 +241,7 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
 
     const issues = await store.searchIssues({
       repoFullName: query.repo,
-      targetVersion: resolvedTargetVersion ?? null,
+      targetVersion: resolvedTargetVersion,
       productLabels,
       state: query.state,
       clusterId: query.clusterId,
@@ -308,6 +317,44 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
     });
 
     return { targetVersion: resolvedTargetVersion ?? null, issues };
+  });
+
+  /**
+   * Get full details for a specific issue, including metadata and similar issues.
+   * Query params:
+   *   - repo: repository full name (required)
+   *   - minSimilarity: minimum similarity threshold for similar issues (optional, default 0.84)
+   *   - limit: max similar issues (optional, default 20)
+   */
+  server.get('/issues/:issueNumber/detail', async (req, reply) => {
+    const { issueNumber } = req.params as { issueNumber: string };
+    const { repo, minSimilarity, limit } = req.query as {
+      repo?: string;
+      minSimilarity?: string;
+      limit?: string;
+    };
+
+    if (!repo) {
+      return reply.code(400).send({ message: 'repo query parameter is required' });
+    }
+
+    const issueNum = Number.parseInt(issueNumber, 10);
+    if (Number.isNaN(issueNum)) {
+      return reply.code(400).send({ message: 'Invalid issue number' });
+    }
+
+    const detail = await store.getIssueDetail({
+      repoFullName: repo,
+      issueNumber: issueNum,
+      minSimilarity: minSimilarity ? Number.parseFloat(minSimilarity) : undefined,
+      limit: limit ? Number.parseInt(limit, 10) : undefined,
+    });
+
+    if (!detail) {
+      return reply.code(404).send({ message: 'Issue not found' });
+    }
+
+    return detail;
   });
 
   /**
