@@ -1,9 +1,10 @@
 import type { FastifyInstance } from 'fastify';
 import { ServiceBusClient, type ServiceBusSender } from '@azure/service-bus';
-import type { IssueReclusterRequest, IssueSyncRequest, RegenerateReleaseNoteRequest } from '@release-agent/contracts';
+import type { GenerateTestChecklistRequest, IssueReclusterRequest, IssueSyncRequest, RegenerateReleaseNoteRequest } from '@release-agent/contracts';
 
 export type SessionRunEnqueuer = (sessionId: string) => Promise<void>;
 export type CommitRegenEnqueuer = (request: RegenerateReleaseNoteRequest) => Promise<void>;
+export type TestChecklistEnqueuer = (request: GenerateTestChecklistRequest) => Promise<void>;
 export type IssueSyncEnqueuer = (request: IssueSyncRequest) => Promise<void>;
 export type IssueReclusterEnqueuer = (request: IssueReclusterRequest) => Promise<void>;
 
@@ -48,6 +49,11 @@ export function createSessionRunEnqueuer(server: FastifyInstance): SessionRunEnq
 export function createCommitRegenEnqueuer(server: FastifyInstance): CommitRegenEnqueuer | null {
   const queueName = process.env.SERVICEBUS_COMMIT_REGEN_QUEUE ?? 'commit-regen';
   return createEnqueuer<RegenerateReleaseNoteRequest>(server, queueName, 'commit-regen');
+}
+
+export function createTestChecklistEnqueuer(server: FastifyInstance): TestChecklistEnqueuer | null {
+  const queueName = process.env.SERVICEBUS_TESTPLAN_CHECKLIST_QUEUE ?? 'testplan-checklist';
+  return createEnqueuer<GenerateTestChecklistRequest>(server, queueName, 'testplan-checklist');
 }
 
 export function createIssueSyncEnqueuer(server: FastifyInstance): IssueSyncEnqueuer | null {

@@ -68,31 +68,95 @@ export type HotspotsArtifact = {
 };
 
 export type TestPlanPriority = 'Must' | 'Recommended' | 'Exploratory';
+export type TestPlanCaseType = 'Functional' | 'Regression' | 'Negative' | 'Integration' | 'Security' | 'Performance' | 'Exploratory';
+export type TestPlanRisk = 'High' | 'Medium' | 'Low';
+
+export type TestPlanCase = {
+  id: string;
+  text: string;
+  checked: boolean;
+  priority: TestPlanPriority;
+  source: string;
+  title?: string;
+  objective?: string;
+  preconditions?: string[];
+  steps?: string[];
+  expected?: string;
+  type?: TestPlanCaseType;
+  risk?: TestPlanRisk;
+  sourceRefs?: string[];
+  tags?: string[];
+};
+
+export type TestPlanChecklistStatus = 'queued' | 'running' | 'completed' | 'failed';
+
+export type TestPlanChecklistItem = {
+  id: string;
+  prNumber: number;
+  area: string;
+  title: string;
+  status: TestPlanChecklistStatus;
+  markdown?: string | null;
+  error?: string | null;
+  updatedAt: string;
+  sourceRefs?: string[];
+  templateUrl?: string | null;
+};
+
+export type TestPlanChecklists = {
+  templateUrl: string | null;
+  queuedAt: string | null;
+  generatedAt: string | null;
+  summary: {
+    total: number;
+    queued: number;
+    running: number;
+    completed: number;
+    failed: number;
+  };
+  items: TestPlanChecklistItem[];
+};
 
 export type TestPlanArtifact = {
   sessionId: string;
   sections: Array<{
     area: string;
-    cases: Array<{
-      id: string;
-      text: string;
-      checked: boolean;
-      priority: TestPlanPriority;
-      source: string;
-    }>;
+    cases: TestPlanCase[];
   }>;
+  checklists?: TestPlanChecklists;
 };
+
+export type PatchTestPlanCasePatch = Partial<{
+  text: string;
+  title: string;
+  objective: string;
+  expected: string;
+  preconditions: string[];
+  steps: string[];
+  source: string;
+  sourceRefs: string[];
+  tags: string[];
+  type: TestPlanCaseType;
+  risk: TestPlanRisk;
+}>;
 
 export type PatchTestPlanOp =
   | { op: 'updateText'; caseId: string; text: string }
   | { op: 'check'; caseId: string }
   | { op: 'uncheck'; caseId: string }
   | { op: 'changePriority'; caseId: string; priority: TestPlanPriority }
+  | { op: 'updateCase'; caseId: string; patch: PatchTestPlanCasePatch }
   | { op: 'addCase'; caseId?: string; area: string; text: string; priority?: TestPlanPriority }
   | { op: 'deleteCase'; caseId: string };
 
 export type PatchTestPlanRequest = {
   operations: PatchTestPlanOp[];
+};
+
+export type GenerateTestChecklistRequest = {
+  sessionId: string;
+  prNumber: number;
+  templateUrl?: string;
 };
 
 // Regenerate request for release note items

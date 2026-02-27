@@ -3,30 +3,32 @@ import type { ChangeInput, Hotspot } from '../agents/types.js';
 /**
  * System prompt for Test Plan Agent
  */
-export const TEST_PLAN_SYSTEM_PROMPT = `You are a Test Plan Agent. Your job is to generate practical test cases based on code changes and risk analysis.
+export const TEST_PLAN_SYSTEM_PROMPT = `You are a senior release test lead.
 
-Guidelines:
-1. Focus on functional testing that validates the changes work correctly
-2. Consider edge cases and error scenarios
-3. Prioritize test cases based on:
-   - "Must" = Critical functionality, security-related, high-risk areas
-   - "Recommended" = Important features, regression prevention
-   - "Exploratory" = Nice to have, edge cases, stress testing
+Generate a practical, execution-ready manual test plan from release changes and risk hotspots.
 
-4. Write test cases that are:
-   - Actionable (clear steps implied)
-   - Specific (not vague)
-   - Testable (has clear pass/fail criteria)
-   
-5. Group test cases by product area
-6. Include both positive and negative test cases
-7. Consider integration points between features
-8. For security changes, include security-focused test cases
+Quality bar:
+1) Every test case must be runnable by a tester without guessing intent.
+2) Use concrete setup, concrete action, and explicit expected outcome.
+3) Make test coverage risk-based, not evenly distributed.
+4) Cover both validation and regression behavior.
+5) Avoid duplicate cases; merge overlap into one stronger case.
 
-Format each test case as a concise action:
-- "Verify that [feature] works when [condition]"
-- "Test [feature] with [edge case]"
-- "Confirm [expected behavior] after [action]"`;
+Priority policy:
+- Must: release-blocking risk, security impact, high hotspot score, core workflows.
+- Recommended: important workflows and regressions.
+- Exploratory: lower-risk edge/fuzz/behavior discovery.
+
+Case type policy:
+- Functional, Regression, Negative, Integration, Security, Performance, Exploratory.
+- Match type to scenario intent.
+
+Output policy:
+- Group cases by area.
+- Include sourceRefs that tie cases to PRs/areas/hotspots.
+- Keep steps concise and ordered.
+- Keep tags short and useful for filtering.
+- Use realistic language for QA execution (no placeholders, no generic "ensure it works").`;
 
 /**
  * Build user prompt for generating test plan
@@ -47,7 +49,7 @@ export function buildTestPlanPrompt(
     const riskNote = hotspot ? ` (Risk Score: ${hotspot.score}/100)` : '';
     
     return `${area}${riskNote}:
-${areaChanges.map(c => `  - PR #${c.number}: ${c.title} [${c.type}, ${c.risk} risk]`).join('\n')}`;
+${areaChanges.map(c => `  - PR #${c.number}: ${c.title} [${c.type}, ${c.risk} risk, files=${c.filesChanged}, churn=${c.additions + c.deletions}] signals=${c.signals.join(', ') || 'none'}`).join('\n')}`;
   }).join('\n\n');
 
   const hotspotsList = hotspots
@@ -55,7 +57,7 @@ ${areaChanges.map(c => `  - PR #${c.number}: ${c.title} [${c.type}, ${c.risk} ri
     .map((h, i) => `  ${i + 1}. ${h.area} (Score: ${h.score}) - ${h.drivers.join(', ')}`)
     .join('\n');
 
-  return `Generate a test plan for this release.
+  return `Generate a detailed manual test plan for this release.
 
 Changes by area:
 ${changesList}
@@ -63,13 +65,35 @@ ${changesList}
 Top risk areas (hotspots):
 ${hotspotsList || '  (none identified)'}
 
-Generate test cases grouped by area. For each area:
-1. Consider the specific changes made
-2. Include tests for the happy path
-3. Include edge cases and error scenarios
-4. Higher priority for hotspot areas
+Requirements:
+1) Group test cases by area.
+2) For each area, include:
+   - happy path validation
+   - regression safety net
+   - negative/error handling
+   - integration behavior when relevant
+3) For hotspot areas (score >= 70), include at least one Must and one Regression case.
+4) For security-sensitive changes, include at least one Security case.
+5) Keep duplication low; prefer broader high-value scenarios.
 
-Aim for 3-5 test cases per area that has changes, more for high-risk areas.`;
+Case schema guidance:
+- text: short one-line summary.
+- title: concise scenario title.
+- objective: what behavior/risk is being validated.
+- preconditions: list of setup items.
+- steps: ordered list of concrete actions.
+- expected: explicit pass criteria.
+- priority: Must | Recommended | Exploratory.
+- type: Functional | Regression | Negative | Integration | Security | Performance | Exploratory.
+- risk: High | Medium | Low.
+- source: primary source (for example "PR #123").
+- sourceRefs: all related PR/area references.
+- tags: short labels (for example "install", "settings", "upgrade", "ux", "api").
+
+Target depth:
+- 3-6 cases for high-risk areas.
+- 2-4 cases for medium-risk areas.
+- 1-3 cases for low-risk areas.`;
 }
 
 /**
@@ -98,9 +122,20 @@ ${changesList}
 Existing test cases:
 ${existingList}
 
-Generate 3-5 NEW test cases that cover scenarios not already covered above. Focus on:
-1. Edge cases
-2. Error handling
-3. Integration with other features
-4. Performance considerations (if relevant)`;
+Generate 2-4 NEW non-overlapping cases with this structure:
+- title + text summary
+- objective
+- preconditions[]
+- steps[]
+- expected
+- priority
+- type
+- risk
+- source/sourceRefs/tags
+
+Focus on coverage gaps only:
+1) edge and negative behavior not covered
+2) regression checks for risky behavior
+3) integration points with adjacent areas
+4) performance/security checks only when relevant`;
 }

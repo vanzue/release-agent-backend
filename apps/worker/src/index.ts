@@ -3,11 +3,13 @@ import { ServiceBusClient } from '@azure/service-bus';
 import { createDb } from './db.js';
 import { setJob, setSessionStatus } from './store.js';
 import { runSession, regenerateCommitSummary } from './sessionRunner.js';
-import type { RegenerateReleaseNoteRequest } from '@release-agent/contracts';
+import type { GenerateTestChecklistRequest, RegenerateReleaseNoteRequest } from '@release-agent/contracts';
 import type { IssueReclusterRequest, IssueSyncRequest } from './issues/types.js';
 import { syncIssues } from './issues/sync.js';
 import { reclusterBucket } from './issues/recluster.js';
 import { getIssueSyncState } from './issues/issueStore.js';
+import { generateTestChecklistForPr } from './testChecklistRunner.js';
+import { closeWorkerQueueResources } from './queue.js';
 
 const logger = pino({
   level: process.env.LOG_LEVEL ?? 'info',
@@ -20,6 +22,7 @@ const logger = pino({
 // Queue names
 const sessionRunQueueName = process.env.SERVICEBUS_SESSION_RUN_QUEUE ?? 'session-run';
 const commitRegenQueueName = process.env.SERVICEBUS_COMMIT_REGEN_QUEUE ?? 'commit-regen';
+const testChecklistQueueName = process.env.SERVICEBUS_TESTPLAN_CHECKLIST_QUEUE ?? 'testplan-checklist';
 const issueSyncQueueName = process.env.SERVICEBUS_ISSUE_SYNC_QUEUE ?? 'issue-sync';
 const issueReclusterQueueName = process.env.SERVICEBUS_ISSUE_RECLUSTER_QUEUE ?? 'issue-recluster';
 const connectionString = process.env.SERVICEBUS_CONNECTION_STRING;
@@ -33,6 +36,7 @@ if (!connectionString) {
 const client = new ServiceBusClient(connectionString);
 const sessionRunReceiver = client.createReceiver(sessionRunQueueName);
 const commitRegenReceiver = client.createReceiver(commitRegenQueueName);
+const testChecklistReceiver = client.createReceiver(testChecklistQueueName);
 const issueSyncReceiver = client.createReceiver(issueSyncQueueName);
 const issueReclusterReceiver = client.createReceiver(issueReclusterQueueName);
 const db = createDb();
@@ -89,6 +93,7 @@ const sessionRunSubscription = sessionRunReceiver.subscribe({
         await setJob(db, sessionId, 'generate-notes', 'failed', 100, e instanceof Error ? e.message : String(e));
         await setJob(db, sessionId, 'analyze-hotspots', 'failed', 100, e instanceof Error ? e.message : String(e));
         await setJob(db, sessionId, 'generate-testplan', 'failed', 100, e instanceof Error ? e.message : String(e));
+        await setJob(db, sessionId, 'generate-testchecklists', 'failed', 100, e instanceof Error ? e.message : String(e));
         await setSessionStatus(db, sessionId, 'failed');
       } catch (inner) {
         logger.error({ err: inner, sessionId }, 'Failed to record failure state');
@@ -119,6 +124,28 @@ const commitRegenSubscription = commitRegenReceiver.subscribe({
   },
   async processError(args) {
     logger.error({ args }, 'Service Bus commit-regen receiver error');
+  },
+});
+
+// Subscribe to testplan-checklist queue
+const testChecklistSubscription = testChecklistReceiver.subscribe({
+  async processMessage(message) {
+    logger.info({ messageId: message.messageId, body: message.body }, 'Received testplan-checklist message');
+
+    const body = message.body as GenerateTestChecklistRequest;
+    if (!body?.sessionId || typeof body?.prNumber !== 'number') {
+      logger.error({ messageId: message.messageId, body }, 'Invalid message body; expected GenerateTestChecklistRequest');
+      return;
+    }
+
+    try {
+      await generateTestChecklistForPr(db, body);
+    } catch (e) {
+      logger.error({ err: e, body }, 'Test checklist generation failed');
+    }
+  },
+  async processError(args) {
+    logger.error({ args }, 'Service Bus testplan-checklist receiver error');
   },
 });
 
@@ -171,18 +198,21 @@ process.on('SIGINT', async () => {
   logger.info('Shutting down...');
   await sessionRunSubscription.close();
   await commitRegenSubscription.close();
+  await testChecklistSubscription.close();
   await issueSyncSubscription.close();
   await issueReclusterSubscription.close();
   await sessionRunReceiver.close();
   await commitRegenReceiver.close();
+  await testChecklistReceiver.close();
   await issueSyncReceiver.close();
   await issueReclusterReceiver.close();
   await client.close();
+  await closeWorkerQueueResources();
   await db.pool.end();
   process.exit(0);
 });
 
 logger.info(
-  { sessionRunQueueName, commitRegenQueueName, issueSyncQueueName, issueReclusterQueueName },
+  { sessionRunQueueName, commitRegenQueueName, testChecklistQueueName, issueSyncQueueName, issueReclusterQueueName },
   'Worker started; waiting for messages'
 );

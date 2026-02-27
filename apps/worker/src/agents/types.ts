@@ -66,11 +66,31 @@ export type AnalysisResult = z.infer<typeof AnalysisResultSchema>;
 export const TestPrioritySchema = z.enum(['Must', 'Recommended', 'Exploratory']);
 export type TestPriority = z.infer<typeof TestPrioritySchema>;
 
+export const TestCaseTypeSchema = z.enum([
+  'Functional',
+  'Regression',
+  'Negative',
+  'Integration',
+  'Security',
+  'Performance',
+  'Exploratory',
+]);
+export type TestCaseType = z.infer<typeof TestCaseTypeSchema>;
+
 export const TestCaseSchema = z.object({
   id: z.string(),
-  text: z.string().describe('The test case description'),
+  text: z.string().describe('Short one-line summary of the test case'),
+  title: z.string().describe('Readable scenario title'),
+  objective: z.string().describe('What risk or behavior this test validates'),
+  preconditions: z.array(z.string()).describe('Setup or prerequisite state before execution'),
+  steps: z.array(z.string()).describe('Ordered test steps the tester should run'),
+  expected: z.string().describe('Expected outcome to validate pass/fail'),
   priority: TestPrioritySchema.describe('Test priority level'),
-  source: z.string().describe('Which PR or area this test case is for'),
+  type: TestCaseTypeSchema.describe('Type of testing required'),
+  risk: RiskLevelSchema.describe('Risk level if this test fails'),
+  source: z.string().describe('Primary source PR or area'),
+  sourceRefs: z.array(z.string()).describe('Related PRs or areas that motivated this case'),
+  tags: z.array(z.string()).describe('Short labels for filtering/grouping'),
 });
 export type TestCase = z.infer<typeof TestCaseSchema>;
 

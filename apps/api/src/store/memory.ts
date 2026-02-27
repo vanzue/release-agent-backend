@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 // type ReleaseStatus = 'active' | 'archived';
 type SessionStatus = 'draft' | 'generating' | 'ready' | 'exported';
 type JobStatus = 'pending' | 'running' | 'completed' | 'failed';
-type JobType = 'parse-changes' | 'generate-notes' | 'analyze-hotspots' | 'generate-testplan';
+type JobType = 'parse-changes' | 'generate-notes' | 'analyze-hotspots' | 'generate-testplan' | 'generate-testchecklists';
 
 export type Session = {
   id: string;
@@ -70,6 +70,7 @@ export const MemoryStore = {
       { id: randomUUID(), sessionId: id, type: 'generate-notes', status: 'pending', progress: 0 },
       { id: randomUUID(), sessionId: id, type: 'analyze-hotspots', status: 'pending', progress: 0 },
       { id: randomUUID(), sessionId: id, type: 'generate-testplan', status: 'pending', progress: 0 },
+      { id: randomUUID(), sessionId: id, type: 'generate-testchecklists', status: 'pending', progress: 0 },
     ];
     jobs.set(id, initialJobs);
 
@@ -84,4 +85,3 @@ export const MemoryStore = {
     return jobs.get(sessionId) ?? [];
   },
 };
-

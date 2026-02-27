@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 
 type SessionStatus = 'draft' | 'generating' | 'ready' | 'exported';
 type JobStatus = 'pending' | 'running' | 'completed' | 'failed';
-type JobType = 'parse-changes' | 'generate-notes' | 'analyze-hotspots' | 'generate-testplan';
+type JobType = 'parse-changes' | 'generate-notes' | 'analyze-hotspots' | 'generate-testplan' | 'generate-testchecklists';
 
 export type Session = {
   id: string;
@@ -162,7 +162,7 @@ export function createPgStore(db: Db) {
         [sessionId, input.repoFullName, input.name, input.baseRef, input.headRef, JSON.stringify(input.options ?? {})]
       );
 
-      const jobTypes: JobType[] = ['parse-changes', 'generate-notes', 'analyze-hotspots', 'generate-testplan'];
+      const jobTypes: JobType[] = ['parse-changes', 'generate-notes', 'analyze-hotspots', 'generate-testplan', 'generate-testchecklists'];
       await db.pool.query(
         `
         insert into jobs (id, session_id, type, status, progress)

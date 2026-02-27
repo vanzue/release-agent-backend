@@ -15,6 +15,7 @@ import { commitToReleaseNoteText, formatReleaseNote } from './releaseNotes.js';
 import { upsertCommitSummary, getCommitSummaries } from './commitSummaries.js';
 import { getReleaseNotesAgent, getAnalysisAgent, getTestPlanAgent, type ChangeInput, type Hotspot, type CommitInput } from './agents/index.js';
 import type { RegenerateReleaseNoteRequest } from '@release-agent/contracts';
+import { enqueueTestChecklistJobs } from './queue.js';
 
 const logger = pino({
   name: 'session-runner',
@@ -60,6 +61,34 @@ type ChangesArtifact = { sessionId: string; items: any[] };
 type HotspotsArtifact = { sessionId: string; items: Hotspot[] };
 type ReleaseNotesArtifact = { sessionId: string; sections: any[] };
 type TestPlanArtifact = { sessionId: string; sections: any[] };
+type TestChecklistStatus = 'queued' | 'running' | 'completed' | 'failed';
+type TestChecklistItem = {
+  id: string;
+  prNumber: number;
+  area: string;
+  title: string;
+  status: TestChecklistStatus;
+  markdown: string | null;
+  error: string | null;
+  updatedAt: string;
+  sourceRefs: string[];
+  templateUrl: string | null;
+};
+type TestPlanArtifactWithChecklists = TestPlanArtifact & {
+  checklists?: {
+    templateUrl: string | null;
+    queuedAt: string | null;
+    generatedAt: string | null;
+    summary: {
+      total: number;
+      queued: number;
+      running: number;
+      completed: number;
+      failed: number;
+    };
+    items: TestChecklistItem[];
+  };
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -103,6 +132,58 @@ async function failJob(ctx: SessionContext, job: string, error: string, skipJobs
     }
   }
   await setSessionStatus(ctx.db, ctx.sessionId, 'failed');
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function normalizeTestPlanArtifactWithChecklists(sessionId: string, data: any): TestPlanArtifactWithChecklists {
+  const sections = Array.isArray(data?.sections) ? data.sections : [];
+  const rawChecklists = data?.checklists ?? {};
+  const items: TestChecklistItem[] = Array.isArray(rawChecklists.items)
+    ? rawChecklists.items
+        .map((item: any) => {
+          if (!item || typeof item.prNumber !== 'number') return null;
+          const status = item.status as TestChecklistStatus;
+          if (status !== 'queued' && status !== 'running' && status !== 'completed' && status !== 'failed') return null;
+          return {
+            id: typeof item.id === 'string' && item.id.trim() ? item.id : `pr-${item.prNumber}`,
+            prNumber: item.prNumber,
+            area: typeof item.area === 'string' ? item.area : 'General',
+            title: typeof item.title === 'string' ? item.title : `PR #${item.prNumber}`,
+            status,
+            markdown: typeof item.markdown === 'string' ? item.markdown : null,
+            error: typeof item.error === 'string' ? item.error : null,
+            updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : nowIso(),
+            sourceRefs: Array.isArray(item.sourceRefs)
+              ? item.sourceRefs.filter((v: unknown) => typeof v === 'string')
+              : [],
+            templateUrl: typeof item.templateUrl === 'string' ? item.templateUrl : null,
+          };
+        })
+        .filter((item: TestChecklistItem | null): item is TestChecklistItem => Boolean(item))
+    : [];
+
+  const summary = {
+    total: items.length,
+    queued: items.filter((item) => item.status === 'queued').length,
+    running: items.filter((item) => item.status === 'running').length,
+    completed: items.filter((item) => item.status === 'completed').length,
+    failed: items.filter((item) => item.status === 'failed').length,
+  };
+
+  return {
+    sessionId: data?.sessionId ?? sessionId,
+    sections,
+    checklists: {
+      templateUrl: typeof rawChecklists.templateUrl === 'string' ? rawChecklists.templateUrl : null,
+      queuedAt: typeof rawChecklists.queuedAt === 'string' ? rawChecklists.queuedAt : null,
+      generatedAt: typeof rawChecklists.generatedAt === 'string' ? rawChecklists.generatedAt : null,
+      summary,
+      items,
+    },
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -153,7 +234,7 @@ async function runParseChanges(ctx: SessionContext): Promise<ChangesArtifact | n
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     logger.error({ err: error, sessionId }, 'Parse changes failed');
-    await failJob(ctx, 'parse-changes', msg, ['generate-notes', 'analyze-hotspots', 'generate-testplan']);
+    await failJob(ctx, 'parse-changes', msg, ['generate-notes', 'analyze-hotspots', 'generate-testplan', 'generate-testchecklists']);
     return null;
   }
 }
@@ -551,6 +632,7 @@ async function runGenerateTestPlan(
     logger.warn({ sessionId }, 'LLM not configured for test plan, skipping');
     const artifact: TestPlanArtifact = { sessionId, sections: [] };
     await upsertArtifact(db, sessionId, 'test-plan', artifact);
+    await setSessionStats(db, sessionId, { testCasesCount: 0 });
     await setJob(db, sessionId, 'generate-testplan', 'completed', 100);
     return artifact;
   }
@@ -558,6 +640,7 @@ async function runGenerateTestPlan(
   if (!changesArtifact.items?.length) {
     const artifact: TestPlanArtifact = { sessionId, sections: [] };
     await upsertArtifact(db, sessionId, 'test-plan', artifact);
+    await setSessionStats(db, sessionId, { testCasesCount: 0 });
     await setJob(db, sessionId, 'generate-testplan', 'completed', 100);
     return artifact;
   }
@@ -575,15 +658,26 @@ async function runGenerateTestPlan(
         area: s.area,
         cases: s.cases.map((c) => ({
           id: c.id,
-          text: c.text,
+          text: c.text || c.title || c.objective,
+          title: c.title,
+          objective: c.objective,
+          preconditions: c.preconditions ?? [],
+          steps: c.steps ?? [],
+          expected: c.expected,
           checked: false,
           priority: c.priority,
+          type: c.type,
+          risk: c.risk,
           source: c.source,
+          sourceRefs: c.sourceRefs ?? [c.source],
+          tags: c.tags ?? [],
         })),
       })),
     };
 
     await upsertArtifact(db, sessionId, 'test-plan', artifact);
+    const totalCases = artifact.sections.reduce((sum, section) => sum + (section.cases?.length ?? 0), 0);
+    await setSessionStats(db, sessionId, { testCasesCount: totalCases });
     await setJob(db, sessionId, 'generate-testplan', 'completed', 100);
     logger.info({ sessionId, sections: artifact.sections.length }, 'Test plan complete');
 
@@ -593,6 +687,131 @@ async function runGenerateTestPlan(
     logger.error({ err: error, sessionId }, 'Test plan generation failed');
     await failJob(ctx, 'generate-testplan', msg);
     return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Job 5: Generate Per-PR Test Checklists (Queued)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runGenerateTestChecklists(
+  ctx: SessionContext,
+  changesArtifact: ChangesArtifact,
+  testPlanArtifact: TestPlanArtifact | null
+): Promise<void> {
+  const { db, sessionId } = ctx;
+
+  const templateUrl =
+    process.env.TEST_CHECKLIST_TEMPLATE_URL?.trim() ||
+    'https://raw.githubusercontent.com/microsoft/PowerToys/releaseChecklist/doc/releases/tests-checklist-template-advanced-paste-section.md';
+
+  const currentArtifact = normalizeTestPlanArtifactWithChecklists(
+    sessionId,
+    testPlanArtifact ?? (await getArtifact(db, sessionId, 'test-plan')) ?? { sessionId, sections: [] }
+  );
+
+  const changes = Array.isArray(changesArtifact.items) ? changesArtifact.items : [];
+  const uniquePrs = Array.from(
+    new Map(
+      changes
+        .map((item: any) => ({
+          prNumber: Number(item?.number),
+          area: typeof item?.area === 'string' ? item.area : 'General',
+          title: typeof item?.title === 'string' ? item.title : `PR #${item?.number ?? 0}`,
+        }))
+        .filter((item) => Number.isFinite(item.prNumber) && item.prNumber > 0)
+        .map((item) => [item.prNumber, item])
+    ).values()
+  );
+
+  if (uniquePrs.length === 0) {
+    currentArtifact.checklists = {
+      templateUrl,
+      queuedAt: null,
+      generatedAt: nowIso(),
+      summary: { total: 0, queued: 0, running: 0, completed: 0, failed: 0 },
+      items: [],
+    };
+    await upsertArtifact(db, sessionId, 'test-plan', currentArtifact);
+    await setJob(db, sessionId, 'generate-testchecklists', 'completed', 100);
+    return;
+  }
+
+  await setJob(db, sessionId, 'generate-testchecklists', 'running', 5);
+
+  const existingByPr = new Map<number, TestChecklistItem>(
+    (currentArtifact.checklists?.items ?? []).map((item) => [item.prNumber, item])
+  );
+
+  const queuedAt = nowIso();
+  const items: TestChecklistItem[] = [];
+  const queueRequests: Array<{ sessionId: string; prNumber: number; templateUrl: string }> = [];
+
+  for (const pr of uniquePrs) {
+    const existing = existingByPr.get(pr.prNumber);
+    const base: TestChecklistItem = existing
+      ? {
+          ...existing,
+          area: pr.area,
+          title: pr.title,
+          templateUrl,
+          updatedAt: queuedAt,
+          sourceRefs: Array.from(new Set([`PR #${pr.prNumber}`, `Area: ${pr.area}`])),
+        }
+      : {
+          id: `pr-${pr.prNumber}`,
+          prNumber: pr.prNumber,
+          area: pr.area,
+          title: pr.title,
+          status: 'queued',
+          markdown: null,
+          error: null,
+          updatedAt: queuedAt,
+          sourceRefs: [`PR #${pr.prNumber}`, `Area: ${pr.area}`],
+          templateUrl,
+        };
+
+    if (base.status !== 'completed') {
+      base.status = 'queued';
+      base.error = null;
+      queueRequests.push({ sessionId, prNumber: pr.prNumber, templateUrl });
+    }
+    items.push(base);
+  }
+
+  const completedCount = items.filter((item) => item.status === 'completed').length;
+  const queuedCount = items.filter((item) => item.status === 'queued').length;
+
+  currentArtifact.checklists = {
+    templateUrl,
+    queuedAt,
+    generatedAt: queuedCount === 0 ? nowIso() : null,
+    summary: {
+      total: items.length,
+      queued: queuedCount,
+      running: 0,
+      completed: completedCount,
+      failed: items.filter((item) => item.status === 'failed').length,
+    },
+    items,
+  };
+
+  await upsertArtifact(db, sessionId, 'test-plan', currentArtifact);
+
+  if (queueRequests.length === 0) {
+    await setJob(db, sessionId, 'generate-testchecklists', 'completed', 100);
+    return;
+  }
+
+  try {
+    await enqueueTestChecklistJobs(queueRequests);
+    const progress = Math.max(5, Math.min(95, Math.round((completedCount / items.length) * 100)));
+    await setJob(db, sessionId, 'generate-testchecklists', 'running', progress);
+    await setSessionStatus(db, sessionId, 'generating');
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logger.error({ err: error, sessionId }, 'Failed to enqueue test checklist jobs');
+    await failJob(ctx, 'generate-testchecklists', msg);
   }
 }
 
@@ -636,22 +855,35 @@ export async function runSession(db: Db, sessionId: string) {
     // Hotspots failed but was not expected to (fallback should have worked)
     logger.error({ sessionId }, 'Session failed at analyze-hotspots');
     await setJob(db, sessionId, 'generate-testplan', 'skipped', 0, 'Skipped: analyze-hotspots failed');
+    await setJob(db, sessionId, 'generate-testchecklists', 'skipped', 0, 'Skipped: analyze-hotspots failed');
     return;
   }
 
   // Job 4: Generate Test Plan
-  await runGenerateTestPlan(ctx, changesArtifact, hotspotsArtifact);
+  const testPlanArtifact = await runGenerateTestPlan(ctx, changesArtifact, hotspotsArtifact);
+
+  if (!testPlanArtifact) {
+    await setJob(db, sessionId, 'generate-testchecklists', 'skipped', 0, 'Skipped: generate-testplan failed');
+  } else {
+    // Job 5: Queue per-PR test checklist generation
+    await runGenerateTestChecklists(ctx, changesArtifact, testPlanArtifact);
+  }
 
   // Check if any job failed
   const jobsResult = await db.pool.query(
     `SELECT status FROM jobs WHERE session_id = $1`,
     [sessionId]
   );
-  const anyFailed = jobsResult.rows.some((j: { status: string }) => j.status === 'failed');
+  const statuses = jobsResult.rows.map((j: { status: string }) => j.status);
+  const anyFailed = statuses.some((status) => status === 'failed');
+  const hasPendingOrRunning = statuses.some((status) => status === 'pending' || status === 'running');
 
   if (anyFailed) {
     // Status already set to 'failed' by failJob
     logger.warn({ sessionId }, 'Session completed with failures');
+  } else if (hasPendingOrRunning) {
+    await setSessionStatus(db, sessionId, 'generating');
+    logger.info({ sessionId }, 'Session is still generating (waiting for queued checklist jobs)');
   } else {
     await setSessionStatus(db, sessionId, 'ready');
     logger.info({ sessionId }, 'Session completed successfully');
