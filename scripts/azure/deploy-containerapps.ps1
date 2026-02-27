@@ -40,6 +40,7 @@ param(
 
   [string]$ServiceBusQueueName = "session-run",
   [string]$CommitRegenQueueName = "commit-regen",
+  [string]$TestChecklistQueueName = "testplan-checklist",
   [string]$IssueSyncQueueName = "issue-sync",
   [string]$IssueReclusterQueueName = "issue-recluster",
   [int]$IssueAutoSyncIntervalMinutes = 30,
@@ -99,6 +100,7 @@ $apiEnvVars = @(
   "DATABASE_URL=secretref:database-url",
   "SERVICEBUS_CONNECTION_STRING=secretref:servicebus-conn",
   "SERVICEBUS_SESSION_RUN_QUEUE=$ServiceBusQueueName",
+  "SERVICEBUS_TESTPLAN_CHECKLIST_QUEUE=$TestChecklistQueueName",
   "DB_POOL_MAX=10",
   "CORS_ORIGIN=$CorsOrigin"
 )
@@ -144,6 +146,7 @@ $workerEnvVars = @(
   "SERVICEBUS_CONNECTION_STRING=secretref:servicebus-conn",
   "SERVICEBUS_SESSION_RUN_QUEUE=$ServiceBusQueueName",
   "SERVICEBUS_COMMIT_REGEN_QUEUE=$CommitRegenQueueName",
+  "SERVICEBUS_TESTPLAN_CHECKLIST_QUEUE=$TestChecklistQueueName",
   "SERVICEBUS_ISSUE_SYNC_QUEUE=$IssueSyncQueueName",
   "SERVICEBUS_ISSUE_RECLUSTER_QUEUE=$IssueReclusterQueueName",
   "ISSUE_AUTO_SYNC_INTERVAL_MINUTES=$IssueAutoSyncIntervalMinutes",

@@ -19,6 +19,7 @@ jobs:
     env:
       SERVICEBUS_QUEUE_NAME: session-run
       COMMIT_REGEN_QUEUE_NAME: commit-regen
+      TESTPLAN_CHECKLIST_QUEUE_NAME: testplan-checklist
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +32,25 @@ jobs:
 
       - name: Install Container Apps extension
         run: az extension add --name containerapp --upgrade
+
+      - name: Ensure Service Bus queues exist
+        shell: bash
+        env:
+          SB_CONN: ${{ secrets.SERVICEBUS_CONNECTION_STRING }}
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          SESSION_Q: ${{ env.SERVICEBUS_QUEUE_NAME }}
+          REGEN_Q: ${{ env.COMMIT_REGEN_QUEUE_NAME }}
+          CHECKLIST_Q: ${{ env.TESTPLAN_CHECKLIST_QUEUE_NAME }}
+        run: |
+          set -euo pipefail
+          NS=$(echo "$SB_CONN" | sed -n 's#.*Endpoint=sb://\([^./]*\)\..*#\1#p')
+          if [ -z "$NS" ]; then
+            echo "Failed to parse Service Bus namespace from connection string"
+            exit 1
+          fi
+          az servicebus queue create --resource-group "$RG" --namespace-name "$NS" --name "$SESSION_Q" -o none
+          az servicebus queue create --resource-group "$RG" --namespace-name "$NS" --name "$REGEN_Q" -o none
+          az servicebus queue create --resource-group "$RG" --namespace-name "$NS" --name "$CHECKLIST_Q" -o none
 
       - name: Resolve ACR login server
         id: acr
@@ -65,6 +85,7 @@ jobs:
             -WorkerGitHubToken "${{ secrets.WORKER_GITHUB_TOKEN }}" `
             -ServiceBusQueueName "${{ env.SERVICEBUS_QUEUE_NAME }}" `
             -CommitRegenQueueName "${{ env.COMMIT_REGEN_QUEUE_NAME }}" `
+            -TestChecklistQueueName "${{ env.TESTPLAN_CHECKLIST_QUEUE_NAME }}" `
             -IssueSyncQueueName "issue-sync" `
             -IssueReclusterQueueName "issue-recluster" `
             -IssueAutoSyncIntervalMinutes 30 `
