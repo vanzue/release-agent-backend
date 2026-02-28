@@ -503,6 +503,9 @@ export function createPgStore(db: Db) {
       const offset = input.offset ?? 0;
       params.push(limit);
       params.push(offset);
+      const clusterJoin = input.clusterId
+        ? 'left join issue_cluster_map m on m.repo = i.repo and m.issue_number = i.issue_number'
+        : '';
 
       const sql = `
         select
@@ -515,7 +518,7 @@ export function createPgStore(db: Db) {
           array_agg(distinct p.product_label) as product_labels
         from issues i
         left join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
-        left join issue_cluster_map m on m.repo = i.repo and m.issue_number = i.issue_number
+        ${clusterJoin}
         where ${conditions.join(' and ')}
         group by i.issue_number, i.title, i.state, i.target_version, i.labels_json, i.updated_at
         order by i.updated_at desc, i.issue_number asc
