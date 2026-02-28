@@ -629,7 +629,7 @@ export function createPgStore(db: Db) {
       const issueRow = issueRes.rows[0];
       if (!issueRow) return null;
 
-      const clusterRes = await db.pool.query(
+      const clusterPromise = db.pool.query(
         `
         select
           m.cluster_id,
@@ -649,40 +649,56 @@ export function createPgStore(db: Db) {
         [input.repoFullName, input.issueNumber]
       );
 
-      const minSim = input.minSimilarity ?? 0.84;
-      const limit = Math.min(input.limit ?? 20, 100);
-      const similarRes = await db.pool.query(
-        `
-        with target as (
-          select embedding, embedding_model
-          from issues
-          where repo = $1
-            and issue_number = $2
-            and embedding is not null
-            and embedding_model is not null
-        )
-        select
-          i.issue_number,
-          i.title,
-          i.state,
-          i.updated_at,
-          1 - (i.embedding <=> t.embedding) as similarity,
-          coalesce(array_agg(distinct p.product_label) filter (where p.product_label is not null), '{}') as product_labels
-        from issues i
-        cross join target t
-        left join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
-        where i.repo = $1
-          and i.issue_number <> $2
-          and i.embedding is not null
-          and i.embedding_model is not distinct from t.embedding_model
-          and vector_dims(i.embedding) = vector_dims(t.embedding)
-          and 1 - (i.embedding <=> t.embedding) >= $3
-        group by i.issue_number, i.title, i.state, i.updated_at, i.embedding, t.embedding, t.embedding_model
-        order by similarity desc
-        limit $4
-        `,
-        [input.repoFullName, input.issueNumber, minSim, limit]
-      );
+      const minSim = input.minSimilarity ?? 0.86;
+      const limit = Math.min(input.limit ?? 10, 100);
+      const candidateLimit = Math.min(Math.max(limit * 4, limit + 10), 400);
+      const similarPromise =
+        issueRow.embedding_model
+          ? db.pool.query(
+              `
+              with target as (
+                select embedding, embedding_model
+                from issues
+                where repo = $1
+                  and issue_number = $2
+                  and embedding is not null
+                  and embedding_model is not null
+              ),
+              candidates as (
+                select
+                  i.issue_number,
+                  i.updated_at,
+                  1 - (i.embedding <=> t.embedding) as similarity
+                from issues i
+                cross join target t
+                where i.repo = $1
+                  and i.issue_number <> $2
+                  and i.embedding is not null
+                  and i.embedding_model is not distinct from t.embedding_model
+                  and vector_dims(i.embedding) = vector_dims(t.embedding)
+                  and 1 - (i.embedding <=> t.embedding) >= $3
+                order by similarity desc, i.updated_at desc
+                limit $5
+              )
+              select
+                i.issue_number,
+                i.title,
+                i.state,
+                i.updated_at,
+                c.similarity,
+                coalesce(array_agg(distinct p.product_label) filter (where p.product_label is not null), '{}') as product_labels
+              from candidates c
+              join issues i on i.repo = $1 and i.issue_number = c.issue_number
+              left join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
+              group by i.issue_number, i.title, i.state, i.updated_at, c.similarity
+              order by c.similarity desc, i.updated_at desc
+              limit $4
+              `,
+              [input.repoFullName, input.issueNumber, minSim, limit, candidateLimit]
+            )
+          : Promise.resolve({ rows: [] as any[] } as any);
+
+      const [clusterRes, similarRes] = await Promise.all([clusterPromise, similarPromise]);
 
       return {
         issue: {
@@ -714,7 +730,7 @@ export function createPgStore(db: Db) {
           representativeIssueNumber: (r.representative_issue_number as number | null) ?? null,
           clusterUpdatedAt: (r.cluster_updated_at as string | null) ?? null,
         })),
-        similarIssues: similarRes.rows.map((r: any) => ({
+        similarIssues: (similarRes.rows as any[]).map((r: any) => ({
           issueNumber: Number(r.issue_number),
           title: r.title as string,
           state: r.state as 'open' | 'closed',
@@ -1205,10 +1221,10 @@ export function createPgStore(db: Db) {
     > {
       const minSim = input.minSimilarity ?? 0.85;
       const limit = Math.min(input.limit ?? 10, 100);
+      const candidateLimit = Math.min(Math.max(limit * (input.productLabel ? 6 : 3), limit + 10), 600);
 
-      // Build the HAVING clause for product label filtering
       const productFilter = input.productLabel
-        ? `having array_agg(distinct p.product_label) @> $5`
+        ? `having array_agg(distinct p.product_label) @> $6`
         : '';
 
       const sql = `
@@ -1219,32 +1235,42 @@ export function createPgStore(db: Db) {
             and issue_number = $2
             and embedding is not null
             and embedding_model is not null
+        ),
+        candidates as (
+          select
+            i.issue_number,
+            i.updated_at,
+            1 - (i.embedding <=> t.embedding) as similarity
+          from issues i
+          cross join target t
+          where i.repo = $1
+            and i.issue_number <> $2
+            and i.embedding is not null
+            and i.embedding_model is not distinct from t.embedding_model
+            and vector_dims(i.embedding) = vector_dims(t.embedding)
+            and 1 - (i.embedding <=> t.embedding) >= $3
+          order by similarity desc, i.updated_at desc
+          limit $5
         )
         select
           i.issue_number,
           i.title,
           i.state,
           i.updated_at,
-          1 - (i.embedding <=> t.embedding) as similarity,
+          c.similarity,
           coalesce(array_agg(distinct p.product_label) filter (where p.product_label is not null), '{}') as product_labels
-        from issues i
-        cross join target t
+        from candidates c
+        join issues i on i.repo = $1 and i.issue_number = c.issue_number
         left join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
-        where i.repo = $1
-          and i.issue_number <> $2
-          and i.embedding is not null
-          and i.embedding_model is not distinct from t.embedding_model
-          and vector_dims(i.embedding) = vector_dims(t.embedding)
-          and 1 - (i.embedding <=> t.embedding) >= $3
-        group by i.issue_number, i.title, i.state, i.updated_at, i.embedding, t.embedding, t.embedding_model
+        group by i.issue_number, i.title, i.state, i.updated_at, c.similarity
         ${productFilter}
-        order by similarity desc
+        order by c.similarity desc, i.updated_at desc
         limit $4
       `;
 
       const params = input.productLabel
-        ? [input.repoFullName, input.issueNumber, minSim, limit, [input.productLabel]]
-        : [input.repoFullName, input.issueNumber, minSim, limit];
+        ? [input.repoFullName, input.issueNumber, minSim, limit, candidateLimit, [input.productLabel]]
+        : [input.repoFullName, input.issueNumber, minSim, limit, candidateLimit];
 
       const res = await db.pool.query(sql, params);
       return res.rows.map((r: any) => ({
