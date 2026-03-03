@@ -5,6 +5,7 @@ import { registerDocsRoutes } from './routes/docs.js';
 import { registerAuthRoutes } from './routes/auth.js';
 import { registerSessionRoutes } from './routes/sessions.js';
 import { registerIssueRoutes } from './routes/issues.js';
+import { registerMcpRoutes } from './routes/mcp.js';
 import { createDb } from './db.js';
 import { createPgStore } from './store/pg.js';
 import { createCommunityAccessController } from './auth/communityAccess.js';
@@ -69,6 +70,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   registerAuthRoutes(server, accessControl);
   registerSessionRoutes(server, store);
   registerIssueRoutes(server, store, db);
+  registerMcpRoutes(server, store);
 
   return server;
 }

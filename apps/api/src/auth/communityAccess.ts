@@ -236,7 +236,10 @@ export function createCommunityAccessController() {
       path === '/openapi.yaml' ||
       path.startsWith('/docs/') ||
       path === '/auth/github/start' ||
-      path === '/auth/github/callback'
+      path === '/auth/github/callback' ||
+      path === '/mcp' ||
+      path === '/sse' ||
+      path === '/messages'
     );
   }
 
