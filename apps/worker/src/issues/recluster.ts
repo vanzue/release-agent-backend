@@ -22,33 +22,46 @@ function issuePopularity(input: { comments: number; reactions: number; updatedAt
   return 2 * commentsScore + 1 * reactionsScore + recency;
 }
 
-// Use '__all__' as a placeholder for NULL targetVersion since the DB schema requires NOT NULL
-const ALL_VERSIONS_PLACEHOLDER = '__all__';
+const ISSUE_CLUSTER_TARGET_VERSION_ALL = '__all__';
+const ISSUE_CLUSTER_TARGET_VERSION_UNVERSIONED = '__null__';
 
 export async function reclusterBucket(db: Db, req: IssueReclusterRequest): Promise<{ clusters: number; mapped: number }> {
   const repoFullName = req.repoFullName;
-  // If targetVersion is null (All Versions), use placeholder for DB storage
-  const targetVersion = req.targetVersion ?? ALL_VERSIONS_PLACEHOLDER;
+  const targetVersionTokenRaw = req.targetVersion ?? ISSUE_CLUSTER_TARGET_VERSION_ALL;
+  const targetVersionToken = targetVersionTokenRaw.trim() || ISSUE_CLUSTER_TARGET_VERSION_ALL;
+  let issueTargetVersionFilter: string | null | undefined;
+  if (targetVersionToken === ISSUE_CLUSTER_TARGET_VERSION_ALL) {
+    issueTargetVersionFilter = undefined;
+  } else if (targetVersionToken === ISSUE_CLUSTER_TARGET_VERSION_UNVERSIONED) {
+    issueTargetVersionFilter = null;
+  } else {
+    issueTargetVersionFilter = targetVersionToken;
+  }
+  const filterByVersion = issueTargetVersionFilter !== undefined;
+  const clusterTargetVersionBucket = targetVersionToken;
   const productLabel = req.productLabel;
   const threshold = req.threshold;
   const topK = req.topK;
   const embeddingModel = process.env.ISSUE_EMBEDDING_MODEL_ID?.trim() || null;
 
-  logger.info({ repoFullName, productLabel, threshold, topK }, 'Reclustering bucket');
+  logger.info(
+    { repoFullName, productLabel, threshold, topK, targetVersionToken, issueTargetVersionFilter, filterByVersion },
+    'Reclustering bucket'
+  );
 
   await db.pool.query(
     `
     delete from issue_cluster_map
-    where repo = $1 and product_label = $2
+    where repo = $1 and product_label = $2 and target_version = $3
     `,
-    [repoFullName, productLabel]
+    [repoFullName, productLabel, clusterTargetVersionBucket]
   );
   await db.pool.query(
     `
     delete from clusters
-    where repo = $1 and product_label = $2
+    where repo = $1 and product_label = $2 and target_version = $3
     `,
-    [repoFullName, productLabel]
+    [repoFullName, productLabel, clusterTargetVersionBucket]
   );
 
   const issuesRes = await db.pool.query(
@@ -60,10 +73,11 @@ export async function reclusterBucket(db: Db, req: IssueReclusterRequest): Promi
       and i.state = 'open'
       and i.embedding is not null
       and ($3::text is null or i.embedding_model = $3)
+      and ($4::boolean = false or i.target_version is not distinct from $5)
       and p.product_label = $2
     order by i.issue_number asc
     `,
-    [repoFullName, productLabel, embeddingModel]
+    [repoFullName, productLabel, embeddingModel, filterByVersion, issueTargetVersionFilter ?? null]
   );
 
   const parsedRows = issuesRes.rows.map((row) => {
@@ -113,11 +127,11 @@ export async function reclusterBucket(db: Db, req: IssueReclusterRequest): Promi
       `
       select cluster_id, centroid, size, (centroid <=> $3::vector) as cosine_distance
       from clusters
-      where repo = $1 and product_label = $2
+      where repo = $1 and product_label = $2 and target_version = $4
       order by centroid <=> $3::vector asc
-      limit $4
+      limit $5
       `,
-      [repoFullName, productLabel, embeddingLit, topK]
+      [repoFullName, productLabel, embeddingLit, clusterTargetVersionBucket, topK]
     );
 
     let chosenClusterId: string | null = null;
@@ -142,7 +156,7 @@ export async function reclusterBucket(db: Db, req: IssueReclusterRequest): Promi
         values ($1, $2, $3, $4, $5, $6::vector, 1, $7, $8, now())
         returning cluster_id
         `,
-        [repoFullName, targetVersion, productLabel, threshold, topK, embeddingLit, popularity, issueNumber]
+        [repoFullName, clusterTargetVersionBucket, productLabel, threshold, topK, embeddingLit, popularity, issueNumber]
       );
       const clusterId = created.rows[0].cluster_id as string;
       await db.pool.query(
@@ -150,7 +164,7 @@ export async function reclusterBucket(db: Db, req: IssueReclusterRequest): Promi
         insert into issue_cluster_map (repo, issue_number, target_version, product_label, cluster_id, similarity, assigned_at)
         values ($1, $2, $3, $4, $5, $6, now())
         `,
-        [repoFullName, issueNumber, targetVersion, productLabel, clusterId, 1]
+        [repoFullName, issueNumber, clusterTargetVersionBucket, productLabel, clusterId, 1]
       );
       mapped++;
       continue;
@@ -161,7 +175,7 @@ export async function reclusterBucket(db: Db, req: IssueReclusterRequest): Promi
       insert into issue_cluster_map (repo, issue_number, target_version, product_label, cluster_id, similarity, assigned_at)
       values ($1, $2, $3, $4, $5, $6, now())
       `,
-      [repoFullName, issueNumber, targetVersion, productLabel, chosenClusterId, chosenSimilarity]
+      [repoFullName, issueNumber, clusterTargetVersionBucket, productLabel, chosenClusterId, chosenSimilarity]
     );
 
     const nextCentroid = meanVector(chosenCentroid, chosenSize, embedding);
@@ -191,21 +205,21 @@ export async function reclusterBucket(db: Db, req: IssueReclusterRequest): Promi
       order by (c.centroid <=> i.embedding) asc
       limit 1
     )
-    where c.repo = $1 and c.product_label = $2
+    where c.repo = $1 and c.product_label = $2 and c.target_version = $3
     `,
-    [repoFullName, productLabel]
+    [repoFullName, productLabel, clusterTargetVersionBucket]
   );
 
   const clusterCountRes = await db.pool.query(
     `
     select count(*)::int as cnt
     from clusters
-    where repo = $1 and product_label = $2
+    where repo = $1 and product_label = $2 and target_version = $3
     `,
-    [repoFullName, productLabel]
+    [repoFullName, productLabel, clusterTargetVersionBucket]
   );
   const clusters = Number(clusterCountRes.rows[0]?.cnt ?? 0);
 
-  logger.info({ repoFullName, productLabel, clusters, mapped }, 'Recluster complete');
+  logger.info({ repoFullName, productLabel, targetVersionToken, clusters, mapped }, 'Recluster complete');
   return { clusters, mapped };
 }

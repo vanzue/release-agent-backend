@@ -75,6 +75,21 @@ function pickLatestVersion(versions: Array<string | null>): string | null {
   return best ?? null;
 }
 
+const ISSUE_CLUSTER_TARGET_VERSION_ALL = '__all__';
+const ISSUE_CLUSTER_TARGET_VERSION_UNVERSIONED = '__null__';
+
+function parseTargetVersionQuery(targetVersion: string | undefined): string | null | undefined {
+  if (targetVersion === undefined) return undefined;
+  if (targetVersion === ISSUE_CLUSTER_TARGET_VERSION_ALL) return undefined;
+  if (targetVersion === ISSUE_CLUSTER_TARGET_VERSION_UNVERSIONED) return null;
+  return targetVersion;
+}
+
+function toReclusterTargetVersionToken(targetVersion: string | null | undefined): string {
+  if (targetVersion === null || targetVersion === undefined) return ISSUE_CLUSTER_TARGET_VERSION_ALL;
+  return targetVersion;
+}
+
 function parseBooleanQuery(value: unknown, defaultValue = false): boolean {
   if (typeof value !== 'string') return defaultValue;
   const normalized = value.trim().toLowerCase();
@@ -98,18 +113,7 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore, db:
     const { repo, targetVersion } = req.query as { repo: string; targetVersion?: string };
     const versions = await store.listIssueVersions(repo);
     const defaultTargetVersion = pickLatestVersion(versions.map((v) => v.targetVersion));
-    
-    // If targetVersion is '__null__', user explicitly wants unversioned issues
-    // If targetVersion is undefined, return all versions (no filter)
-    // Otherwise, use the provided version
-    let resolvedTargetVersion: string | null | undefined;
-    if (targetVersion === undefined) {
-      resolvedTargetVersion = undefined; // all versions
-    } else if (targetVersion === '__null__') {
-      resolvedTargetVersion = null; // unversioned
-    } else {
-      resolvedTargetVersion = targetVersion;
-    }
+    const resolvedTargetVersion = parseTargetVersionQuery(targetVersion);
 
     const products = await store.listIssueProducts({
       repoFullName: repo,
@@ -120,20 +124,27 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore, db:
   });
 
   server.get('/issues/clusters', async (req) => {
-    const { repo, productLabel, limit } = req.query as { repo: string; productLabel: string; limit?: string };
+    const { repo, targetVersion, productLabel, limit } = req.query as {
+      repo: string;
+      targetVersion?: string;
+      productLabel: string;
+      limit?: string;
+    };
     const versions = await store.listIssueVersions(repo);
     const defaultTargetVersion = pickLatestVersion(versions.map((v) => v.targetVersion));
+    const resolvedTargetVersion = parseTargetVersionQuery(targetVersion);
 
     const parsedLimit = limit ? Number.parseInt(limit, 10) : undefined;
 
     const clusterResult = await store.listIssueClusters({
       repoFullName: repo,
+      targetVersion: resolvedTargetVersion,
       productLabel,
       limit: Number.isFinite(parsedLimit as number) ? parsedLimit : undefined,
     });
 
     return {
-      targetVersion: null,
+      targetVersion: resolvedTargetVersion ?? null,
       defaultTargetVersion,
       productLabel,
       clusters: clusterResult.clusters,
@@ -205,15 +216,37 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore, db:
 
     if (!enqueueIssueRecluster) return reply.code(501).send({ message: 'Issue recluster queue is not configured' });
 
+    const targetVersionToken = toReclusterTargetVersionToken(body.targetVersion);
     await enqueueIssueRecluster({
       repoFullName: body.repoFullName,
-      targetVersion: body.targetVersion ?? null,
+      targetVersion: targetVersionToken,
       productLabel: body.productLabel,
       threshold: body.threshold,
       topK: body.topK,
     });
 
     return reply.code(202).send({ status: 'queued' });
+  });
+
+  server.get('/issues/recluster-scope', async (req, reply) => {
+    const { repo, targetVersion, productLabel } = req.query as {
+      repo?: string;
+      targetVersion?: string;
+      productLabel?: string;
+    };
+    if (!repo || !productLabel) {
+      return reply.code(400).send({ message: 'repo and productLabel query parameters are required' });
+    }
+
+    const resolvedTargetVersion = parseTargetVersionQuery(targetVersion);
+    const scope = await store.getIssueReclusterScope({
+      repoFullName: repo,
+      targetVersion: resolvedTargetVersion,
+      productLabel,
+      embeddingModel: process.env.ISSUE_EMBEDDING_MODEL_ID?.trim() || null,
+    });
+
+    return scope;
   });
 
   server.get('/issues/search', async (req) => {

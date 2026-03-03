@@ -66,6 +66,21 @@ function mapJob(row: any): Job {
   };
 }
 
+const ISSUE_CLUSTER_TARGET_VERSION_ALL = '__all__';
+const ISSUE_CLUSTER_TARGET_VERSION_UNVERSIONED = '__null__';
+
+function toClusterTargetVersionBucket(targetVersion: string | null | undefined): string {
+  if (targetVersion === undefined) return ISSUE_CLUSTER_TARGET_VERSION_ALL;
+  if (targetVersion === null) return ISSUE_CLUSTER_TARGET_VERSION_UNVERSIONED;
+  return targetVersion;
+}
+
+function fromClusterTargetVersionBucket(targetVersion: string | null): string | null {
+  if (targetVersion === ISSUE_CLUSTER_TARGET_VERSION_ALL) return 'All Versions';
+  if (targetVersion === ISSUE_CLUSTER_TARGET_VERSION_UNVERSIONED) return null;
+  return targetVersion;
+}
+
 function parseVersionTuple(version: string | null | undefined): [number, number, number] | null {
   if (!version) return null;
   const match = version.match(/^(\d+)\.(\d+)(?:\.(\d+))?$/);
@@ -290,6 +305,7 @@ export function createPgStore(db: Db) {
       targetVersion: string | null | undefined; // undefined = all versions
     }): Promise<Array<{ productLabel: string; issueCount: number; clusterCount: number }>> {
       const filterByVersion = input.targetVersion !== undefined;
+      const clusterTargetVersionBucket = toClusterTargetVersionBucket(input.targetVersion);
       const res = await db.pool.query(
         `
         with product_issue_counts as (
@@ -307,11 +323,12 @@ export function createPgStore(db: Db) {
           pic.issue_count,
           (select count(*)::int from clusters c
            where c.repo = $1
-             and c.product_label = pic.product_label) as cluster_count
+             and c.product_label = pic.product_label
+             and c.target_version = $4) as cluster_count
         from product_issue_counts pic
         order by pic.issue_count desc, pic.product_label asc
         `,
-        [input.repoFullName, filterByVersion, input.targetVersion ?? null]
+        [input.repoFullName, filterByVersion, input.targetVersion ?? null, clusterTargetVersionBucket]
       );
 
       return res.rows.map((r: any) => ({
@@ -323,6 +340,7 @@ export function createPgStore(db: Db) {
 
     async listIssueClusters(input: {
       repoFullName: string;
+      targetVersion: string | null | undefined;
       productLabel: string;
       limit?: number;
     }): Promise<{
@@ -339,6 +357,7 @@ export function createPgStore(db: Db) {
     }> {
       const requestedLimit = typeof input.limit === 'number' && Number.isFinite(input.limit) ? input.limit : 100;
       const limit = Math.min(Math.max(Math.trunc(requestedLimit), 10), 300);
+      const clusterTargetVersionBucket = toClusterTargetVersionBucket(input.targetVersion);
       const res = await db.pool.query(
         `
         select
@@ -352,10 +371,11 @@ export function createPgStore(db: Db) {
         left join issues i on i.repo = c.repo and i.issue_number = c.representative_issue_number
         where c.repo = $1
           and c.product_label = $2
+          and c.target_version = $3
         order by c.popularity desc, c.size desc, c.updated_at desc
-        limit $3
+        limit $4
         `,
-        [input.repoFullName, input.productLabel, limit + 1]
+        [input.repoFullName, input.productLabel, clusterTargetVersionBucket, limit + 1]
       );
       const isTruncated = res.rows.length > limit;
       const rows = isTruncated ? res.rows.slice(0, limit) : res.rows;
@@ -370,6 +390,68 @@ export function createPgStore(db: Db) {
         })),
         isTruncated,
         limit,
+      };
+    },
+
+    async getIssueReclusterScope(input: {
+      repoFullName: string;
+      targetVersion: string | null | undefined;
+      productLabel: string;
+      embeddingModel?: string | null;
+    }): Promise<{
+      targetVersion: string | null;
+      productLabel: string;
+      embeddingModel: string | null;
+      openIssueCount: number;
+      openEmbeddedIssueCount: number;
+      existingClusterCount: number;
+      existingMappedIssueCount: number;
+    }> {
+      const filterByVersion = input.targetVersion !== undefined;
+      const clusterTargetVersionBucket = toClusterTargetVersionBucket(input.targetVersion);
+      const embeddingModel = input.embeddingModel?.trim() || null;
+
+      const countRes = await db.pool.query(
+        `
+        select
+          count(distinct i.issue_number)::int as open_issue_count,
+          count(distinct i.issue_number) filter (
+            where i.embedding is not null
+              and ($5::text is null or i.embedding_model = $5)
+          )::int as open_embedded_issue_count
+        from issues i
+        join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
+        where i.repo = $1
+          and p.product_label = $2
+          and i.state = 'open'
+          and ($3::boolean = false or i.target_version is not distinct from $4)
+        `,
+        [input.repoFullName, input.productLabel, filterByVersion, input.targetVersion ?? null, embeddingModel]
+      );
+
+      const existingRes = await db.pool.query(
+        `
+        select
+          count(*)::int as existing_cluster_count,
+          coalesce(sum(size), 0)::int as existing_mapped_issue_count
+        from clusters
+        where repo = $1
+          and product_label = $2
+          and target_version = $3
+        `,
+        [input.repoFullName, input.productLabel, clusterTargetVersionBucket]
+      );
+
+      const countRow = countRes.rows[0] ?? {};
+      const existingRow = existingRes.rows[0] ?? {};
+      return {
+        targetVersion: input.targetVersion ?? null,
+        productLabel: input.productLabel,
+        embeddingModel,
+        openIssueCount: Number(countRow.open_issue_count ?? 0),
+        openEmbeddedIssueCount: Number(countRow.open_embedded_issue_count ?? 0),
+        existingClusterCount: Number(existingRow.existing_cluster_count ?? 0),
+        existingMappedIssueCount: Number(existingRow.existing_mapped_issue_count ?? 0),
       };
     },
 
@@ -401,7 +483,7 @@ export function createPgStore(db: Db) {
       return {
         clusterId: r.cluster_id as string,
         repoFullName: r.repo as string,
-        targetVersion: null,
+        targetVersion: fromClusterTargetVersionBucket((r.target_version as string | null) ?? null),
         productLabel: r.product_label as string,
         thresholdUsed: Number(r.threshold_used ?? 0),
         topkUsed: Number(r.topk_used ?? 0),
@@ -721,7 +803,7 @@ export function createPgStore(db: Db) {
         },
         clusterMemberships: clusterRes.rows.map((r: any) => ({
           clusterId: r.cluster_id as string,
-          targetVersion: (r.target_version as string | null) ?? null,
+          targetVersion: fromClusterTargetVersionBucket((r.target_version as string | null) ?? null),
           productLabel: r.product_label as string,
           similarity: Number(r.similarity ?? 0),
           assignedAt: r.assigned_at as string,
