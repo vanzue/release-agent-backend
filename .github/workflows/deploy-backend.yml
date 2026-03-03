@@ -2,7 +2,7 @@ name: Deploy backend (ACA)
 
 on:
   push:
-    branches: [ stable ]
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
