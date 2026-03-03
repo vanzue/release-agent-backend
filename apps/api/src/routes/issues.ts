@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import type { Db } from '../db.js';
 import type { PgStore } from '../store/pg.js';
 import type { IssueReclusterRequest, IssueSyncRequest } from '@release-agent/contracts';
 import { createIssueReclusterEnqueuer, createIssueSyncEnqueuer } from '../queue.js';
@@ -74,7 +75,15 @@ function pickLatestVersion(versions: Array<string | null>): string | null {
   return best ?? null;
 }
 
-export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
+function parseBooleanQuery(value: unknown, defaultValue = false): boolean {
+  if (typeof value !== 'string') return defaultValue;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on') return true;
+  if (normalized === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off') return false;
+  return defaultValue;
+}
+
+export function registerIssueRoutes(server: FastifyInstance, store: PgStore, db: Db) {
   const enqueueIssueSync = createIssueSyncEnqueuer(server);
   const enqueueIssueRecluster = createIssueReclusterEnqueuer(server);
 
@@ -320,16 +329,18 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
   });
 
   /**
-   * Get full details for a specific issue, including metadata and similar issues.
+   * Get details for a specific issue.
    * Query params:
    *   - repo: repository full name (required)
+   *   - includeSimilar: when true, include semantic similar issues in response (optional, default false)
    *   - minSimilarity: minimum similarity threshold for similar issues (optional, default 0.84)
    *   - limit: max similar issues (optional, default 20)
    */
   server.get('/issues/:issueNumber/detail', async (req, reply) => {
     const { issueNumber } = req.params as { issueNumber: string };
-    const { repo, minSimilarity, limit } = req.query as {
+    const { repo, includeSimilar, minSimilarity, limit } = req.query as {
       repo?: string;
+      includeSimilar?: string;
       minSimilarity?: string;
       limit?: string;
     };
@@ -343,18 +354,123 @@ export function registerIssueRoutes(server: FastifyInstance, store: PgStore) {
       return reply.code(400).send({ message: 'Invalid issue number' });
     }
 
-    const detail = await store.getIssueDetail({
-      repoFullName: repo,
-      issueNumber: issueNum,
-      minSimilarity: minSimilarity ? Number.parseFloat(minSimilarity) : undefined,
-      limit: limit ? Number.parseInt(limit, 10) : undefined,
-    });
+    const includeSimilarIssues = parseBooleanQuery(includeSimilar, false);
+    if (includeSimilarIssues) {
+      const detail = await store.getIssueDetail({
+        repoFullName: repo,
+        issueNumber: issueNum,
+        minSimilarity: minSimilarity ? Number.parseFloat(minSimilarity) : undefined,
+        limit: limit ? Number.parseInt(limit, 10) : undefined,
+      });
 
-    if (!detail) {
+      if (!detail) {
+        return reply.code(404).send({ message: 'Issue not found' });
+      }
+
+      return detail;
+    }
+
+    const issueRes = await db.pool.query(
+      `
+      select
+        i.issue_number,
+        i.gh_id,
+        i.title,
+        i.body,
+        i.body_snip,
+        i.labels_json,
+        i.milestone_title,
+        i.target_version,
+        i.state,
+        i.created_at,
+        i.updated_at,
+        i.closed_at,
+        i.comments_count,
+        i.reactions_total_count,
+        i.embedding_model,
+        coalesce(
+          array_agg(distinct p.product_label) filter (where p.product_label is not null),
+          '{}'
+        ) as product_labels
+      from issues i
+      left join issue_products p on p.repo = i.repo and p.issue_number = i.issue_number
+      where i.repo = $1 and i.issue_number = $2
+      group by
+        i.issue_number,
+        i.gh_id,
+        i.title,
+        i.body,
+        i.body_snip,
+        i.labels_json,
+        i.milestone_title,
+        i.target_version,
+        i.state,
+        i.created_at,
+        i.updated_at,
+        i.closed_at,
+        i.comments_count,
+        i.reactions_total_count,
+        i.embedding_model
+      `,
+      [repo, issueNum]
+    );
+    const issueRow = issueRes.rows[0];
+    if (!issueRow) {
       return reply.code(404).send({ message: 'Issue not found' });
     }
 
-    return detail;
+    const clusterRes = await db.pool.query(
+      `
+      select
+        m.cluster_id,
+        m.target_version,
+        m.product_label,
+        m.similarity,
+        m.assigned_at,
+        c.size as cluster_size,
+        c.popularity as cluster_popularity,
+        c.representative_issue_number,
+        c.updated_at as cluster_updated_at
+      from issue_cluster_map m
+      left join clusters c on c.repo = m.repo and c.cluster_id = m.cluster_id
+      where m.repo = $1 and m.issue_number = $2
+      order by m.similarity desc, m.assigned_at desc
+      `,
+      [repo, issueNum]
+    );
+
+    return {
+      issue: {
+        issueNumber: Number(issueRow.issue_number),
+        ghId: issueRow.gh_id as string,
+        title: issueRow.title as string,
+        body: (issueRow.body as string | null) ?? null,
+        bodySnip: (issueRow.body_snip as string | null) ?? null,
+        labelsJson: issueRow.labels_json,
+        milestoneTitle: (issueRow.milestone_title as string | null) ?? null,
+        targetVersion: (issueRow.target_version as string | null) ?? null,
+        state: issueRow.state as 'open' | 'closed',
+        createdAt: issueRow.created_at as string,
+        updatedAt: issueRow.updated_at as string,
+        closedAt: (issueRow.closed_at as string | null) ?? null,
+        commentsCount: Number(issueRow.comments_count ?? 0),
+        reactionsCount: Number(issueRow.reactions_total_count ?? 0),
+        embeddingModel: (issueRow.embedding_model as string | null) ?? null,
+        productLabels: (issueRow.product_labels as string[] | null) ?? [],
+      },
+      clusterMemberships: clusterRes.rows.map((r: any) => ({
+        clusterId: r.cluster_id as string,
+        targetVersion: (r.target_version as string | null) ?? null,
+        productLabel: r.product_label as string,
+        similarity: Number(r.similarity ?? 0),
+        assignedAt: r.assigned_at as string,
+        clusterSize: Number(r.cluster_size ?? 0),
+        clusterPopularity: Number(r.cluster_popularity ?? 0),
+        representativeIssueNumber: (r.representative_issue_number as number | null) ?? null,
+        clusterUpdatedAt: (r.cluster_updated_at as string | null) ?? null,
+      })),
+      similarIssues: [],
+    };
   });
 
   /**
