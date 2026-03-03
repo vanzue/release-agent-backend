@@ -1,6 +1,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import express from 'express';
+import cors from 'cors';
 import { z } from 'zod';
 
 // ── Config ──────────────────────────────────────────────────────────────
@@ -138,7 +140,10 @@ function createMcpServer() {
 // ── HTTP Server ─────────────────────────────────────────────────────────
 
 const app = express();
+app.use(cors());
 app.use(express.json());
+
+// --- Streamable HTTP transport (modern clients) ---
 
 app.post('/mcp', async (req, res) => {
   try {
@@ -154,8 +159,40 @@ app.post('/mcp', async (req, res) => {
 
 app.get('/mcp', (_req, res) => res.status(405).json({ error: 'Method not allowed. Use POST.' }));
 app.delete('/mcp', (_req, res) => res.status(405).json({ error: 'Method not allowed.' }));
+
+// --- Legacy SSE transport (VS Code, older clients) ---
+
+const sseTransports = new Map<string, { transport: SSEServerTransport; server: McpServer }>();
+
+app.get('/sse', async (req, res) => {
+  const server = createMcpServer();
+  const transport = new SSEServerTransport('/messages', res);
+  const sessionId = transport.sessionId;
+  sseTransports.set(sessionId, { transport, server });
+  res.on('close', () => {
+    sseTransports.delete(sessionId);
+    transport.close?.();
+    server.close();
+  });
+  await server.connect(transport);
+});
+
+app.post('/messages', async (req, res) => {
+  const sessionId = req.query.sessionId as string;
+  const entry = sseTransports.get(sessionId);
+  if (!entry) {
+    res.status(400).json({ error: 'Invalid or expired session. Connect to /sse first.' });
+    return;
+  }
+  await entry.transport.handlePostMessage(req, res);
+});
+
+// --- Health ---
+
 app.get('/health', (_req, res) => res.json({ status: 'ok', name: 'release-agent-mcp' }));
 
 app.listen(PORT, () => {
-  console.log(`Release Agent MCP server listening on http://localhost:${PORT}/mcp`);
+  console.log(`Release Agent MCP server listening on http://localhost:${PORT}`);
+  console.log(`  Streamable HTTP: POST http://localhost:${PORT}/mcp`);
+  console.log(`  Legacy SSE:      GET  http://localhost:${PORT}/sse`);
 });
