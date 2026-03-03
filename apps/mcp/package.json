@@ -1,0 +1,26 @@
+{
+  "name": "@release-agent/mcp",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "release-agent-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx watch --env-file=.env src/index.ts",
+    "build": "node node_modules/typescript/bin/tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "lint": "node -e \"console.log('lint not configured')\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "pg": "^8.13.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.20.0",
+    "typescript": "^5.7.0"
+  }
+}
