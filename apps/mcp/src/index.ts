@@ -61,12 +61,13 @@ function createMcpServer() {
   const server = new McpServer({
     name: 'release-agent-issues',
     version: '1.0.0',
+    description: 'Semantic search over Microsoft PowerToys GitHub issues. Find duplicate issues, related bug reports, feature requests, and known problems across PowerToys modules like FancyZones, PowerToys Run, Color Picker, Always On Top, File Locksmith, and more.',
   });
 
   // Tool 1: Search by natural-language query
   server.tool(
     'search_similar_issues',
-    'Search GitHub issues by semantic similarity. Provide a natural-language description of a bug, feature, or problem and get back the most similar issues.',
+    'Search Microsoft PowerToys GitHub issues by semantic similarity. Describe a bug, feature request, or problem in natural language (e.g. "FancyZones crashes on multi-monitor", "Color Picker high DPI", "PowerToys Run slow startup") and get back the most similar issues ranked by relevance. Useful for finding duplicates, prior art, and related reports across all PowerToys modules.',
     {
       query: z.string().describe('Natural-language description of the issue or problem to search for'),
       repo: z.string().optional().describe(`GitHub repo full name (default: ${DEFAULT_REPO})`),
@@ -100,7 +101,7 @@ function createMcpServer() {
   // Tool 2: Find issues similar to an existing issue by number
   server.tool(
     'find_issues_like',
-    "Find issues that are semantically similar to a given issue number. Uses the existing issue's embedding to search for related issues.",
+    "Find Microsoft PowerToys GitHub issues that are semantically similar to a given issue number. Provide an existing PowerToys issue number and get back related issues — useful for duplicate detection, triage, and understanding the scope of a problem across PowerToys modules.",
     {
       issueNumber: z.number().int().describe('The issue number to find similar issues for'),
       repo: z.string().optional().describe(`GitHub repo full name (default: ${DEFAULT_REPO})`),
