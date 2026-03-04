@@ -48,7 +48,7 @@ const autoSyncRepos = (process.env.ISSUE_AUTO_SYNC_REPOS ?? 'microsoft/PowerToys
   .filter(Boolean);
 const syncSleepMinutes = Number.parseInt(process.env.ISSUE_SYNC_SLEEP_MINUTES ?? '5', 10);
 
-const autoRecluster = (process.env.ISSUE_AUTO_RECLUSTER ?? 'true') === 'true';
+const autoRecluster = (process.env.ISSUE_AUTO_RECLUSTER ?? 'false') === 'true';
 const reclusterThreshold = Number.parseFloat(process.env.ISSUE_RECLUSTER_THRESHOLD ?? '0.85');
 const reclusterTopK = Number.parseInt(process.env.ISSUE_RECLUSTER_TOPK ?? '5', 10);
 
