@@ -61,7 +61,7 @@ const runContinuousSync = async (repoFullName: string) => {
       logger.info({ repoFullName, fetched: result.fetched, embedded: result.embedded }, 'Sync cycle complete');
 
       // Auto-recluster all products after sync
-      if (autoRecluster && result.embedded > 0) {
+      if (autoRecluster) {
         try {
           const { rows: products } = await db.pool.query<{ product_label: string }>(
             `select distinct product_label from issue_products where repo = $1`,
