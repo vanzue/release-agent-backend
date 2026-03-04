@@ -48,13 +48,44 @@ const autoSyncRepos = (process.env.ISSUE_AUTO_SYNC_REPOS ?? 'microsoft/PowerToys
   .filter(Boolean);
 const syncSleepMinutes = Number.parseInt(process.env.ISSUE_SYNC_SLEEP_MINUTES ?? '5', 10);
 
+const autoRecluster = (process.env.ISSUE_AUTO_RECLUSTER ?? 'true') === 'true';
+const reclusterThreshold = Number.parseFloat(process.env.ISSUE_RECLUSTER_THRESHOLD ?? '0.85');
+const reclusterTopK = Number.parseInt(process.env.ISSUE_RECLUSTER_TOPK ?? '5', 10);
+
 const runContinuousSync = async (repoFullName: string) => {
-  logger.info({ repoFullName, syncSleepMinutes }, 'Starting continuous issue sync');
+  logger.info({ repoFullName, syncSleepMinutes, autoRecluster }, 'Starting continuous issue sync');
   
   while (true) {
     try {
       const result = await syncIssues(db, { repoFullName, fullSync: false });
       logger.info({ repoFullName, fetched: result.fetched, embedded: result.embedded }, 'Sync cycle complete');
+
+      // Auto-recluster all products after sync
+      if (autoRecluster && result.embedded > 0) {
+        try {
+          const { rows: products } = await db.pool.query<{ product_label: string }>(
+            `select distinct product_label from issue_products where repo = $1`,
+            [repoFullName],
+          );
+          logger.info({ repoFullName, productCount: products.length }, 'Auto-reclustering all products');
+          for (const { product_label } of products) {
+            try {
+              const clusterResult = await reclusterBucket(db, {
+                repoFullName,
+                productLabel: product_label,
+                threshold: reclusterThreshold,
+                topK: reclusterTopK,
+                targetVersion: '__all__',
+              });
+              logger.info({ repoFullName, productLabel: product_label, ...clusterResult }, 'Product reclustered');
+            } catch (e) {
+              logger.error({ err: e, repoFullName, productLabel: product_label }, 'Recluster failed for product');
+            }
+          }
+        } catch (e) {
+          logger.error({ err: e, repoFullName }, 'Auto-recluster failed');
+        }
+      }
       
       // Sleep before next poll
       logger.debug({ repoFullName, sleepMinutes: syncSleepMinutes }, 'Sleeping before next sync');
