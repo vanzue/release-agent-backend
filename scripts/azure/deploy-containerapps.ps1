@@ -46,6 +46,7 @@ param(
   [int]$IssueAutoSyncIntervalMinutes = 30,
   [string]$IssueEmbeddingModelId = "",
   [string]$CorsOrigin = "",
+  [string]$AccessControlExtraLogins = "",
 
   [switch]$SkipSecrets
 )
@@ -128,6 +129,9 @@ if ($AzureOpenAiEndpoint) {
 }
 if ($AzureOpenAiApiKey) {
   $apiEnvVars += "AZURE_OPENAI_API_KEY=secretref:azure-openai-key"
+}
+if ($AccessControlExtraLogins) {
+  $apiEnvVars += "ACCESS_CONTROL_EXTRA_LOGINS=$AccessControlExtraLogins"
 }
 
 az containerapp update `

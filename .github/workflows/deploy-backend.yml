@@ -99,4 +99,5 @@ jobs:
             -LlmProvider "${{ vars.LLM_PROVIDER }}" `
             -LlmModel "${{ vars.LLM_MODEL }}" `
             -AzureOpenAiEndpoint "${{ vars.AZURE_OPENAI_ENDPOINT }}" `
-            -AzureOpenAiApiKey "${{ secrets.AZURE_OPENAI_API_KEY }}"
+            -AzureOpenAiApiKey "${{ secrets.AZURE_OPENAI_API_KEY }}" `
+            -AccessControlExtraLogins "${{ vars.ACCESS_CONTROL_EXTRA_LOGINS }}"
